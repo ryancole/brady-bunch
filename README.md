@@ -10,7 +10,7 @@ The config defaults to `brady.toml` in the working directory, or next to the exe
 
 ## Install
 
-Download the zip from [Releases](https://github.com/ryancole/brady-bunch/releases), extract it anywhere, and copy `brady.example.toml` to `brady.toml` next to the exe. The exe has no dependencies.
+Download the zip from [Releases](https://github.com/ryancole/brady-bunch/releases), extract it anywhere, and copy `brady.example.toml` to `brady.toml` next to the exe. The exe has no dependencies. The zip also includes `AGENTS.md` ([docs/AGENTS.md](docs/AGENTS.md)), a usage guide for AI agents.
 
 To publish a release, bump `version` in `Cargo.toml`, rename the `[Unreleased]` section of [CHANGELOG.md](CHANGELOG.md) to that version, commit, then push a matching tag. The release fails if the changelog has no section for the version, and that section becomes the release notes.
 

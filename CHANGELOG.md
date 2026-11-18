@@ -4,6 +4,12 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-17
+
+### Added
+
+- `AGENTS.md` in release zips: a usage guide for AI agents covering the command line, the config reference, shutdown behaviour and common pitfalls.
+
 ## [0.2.0] - 2026-11-17
 
 ### Changed
