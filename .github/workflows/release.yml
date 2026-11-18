@@ -16,16 +16,23 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Check tag matches Cargo.toml version
+      - name: Check version and changelog
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
           if ("v$version" -ne $env:GITHUB_REF_NAME) {
             throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
           }
+          # Release notes = this version's CHANGELOG.md section (up to the next "## ").
+          $text = Get-Content CHANGELOG.md -Raw
+          $m = [regex]::Match($text, "(?ms)^## \[$([regex]::Escape($version))\][^\n]*\n(.*?)(?=^## |\z)")
+          if (-not $m.Success -or -not $m.Groups[1].Value.Trim()) {
+            throw "CHANGELOG.md has no '## [$version]' section"
+          }
+          Set-Content release-notes.md $m.Groups[1].Value.Trim()
 
       - name: Build
         run: cargo build --release --locked
@@ -34,7 +41,7 @@ jobs:
         run: |
           $name = "brady-bunch-$env:GITHUB_REF_NAME-x86_64-windows"
           New-Item -ItemType Directory "dist/$name" | Out-Null
-          Copy-Item target/release/brady-bunch.exe, brady.example.toml, README.md "dist/$name"
+          Copy-Item target/release/brady-bunch.exe, brady.example.toml, README.md, CHANGELOG.md "dist/$name"
           Compress-Archive "dist/$name/*" "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           Set-Content "dist/$name.zip.sha256" "$hash  $name.zip" -NoNewline
@@ -42,4 +49,4 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME (Get-ChildItem dist -File).FullName --title $env:GITHUB_REF_NAME --generate-notes
+        run: gh release create $env:GITHUB_REF_NAME (Get-ChildItem dist -File).FullName --title $env:GITHUB_REF_NAME --notes-file release-notes.md
