@@ -4,9 +4,11 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-17
+
 ### Changed
 
-- Release zips include this changelog.
+- Release zips include this changelog, and each release's notes come from its changelog section.
 
 ## [0.1.0] - 2026-11-17
 

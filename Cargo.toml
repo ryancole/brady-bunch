@@ -1,6 +1,6 @@
 [package]
 name = "brady-bunch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Launch a set of programs as child processes and tile their windows inside one host window."
 
