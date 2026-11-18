@@ -42,6 +42,8 @@ pub enum Status {
     Running,
     Exited(u32),
     Failed(String),
+    /// Waiting for apps launched after this one to stop first.
+    StopQueued,
     Stopping,
     Stopped,
 }
@@ -151,7 +153,7 @@ impl Child {
             return None;
         }
         let job = self.job.clone()?;
-        self.status = Status::Stopping;
+        self.status = Status::StopQueued;
         Some(StopPlan {
             job,
             console: self.console,
@@ -160,6 +162,12 @@ impl Child {
             timeout: Duration::from_millis(self.cfg.shutdown_timeout_ms.unwrap_or(default_timeout_ms)),
             helper_exe: helper_exe.to_path_buf(),
         })
+    }
+
+    pub fn begin_stop(&mut self) {
+        if self.status == Status::StopQueued {
+            self.status = Status::Stopping;
+        }
     }
 
     pub fn finish_stop(&mut self) {

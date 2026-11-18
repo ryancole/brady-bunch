@@ -19,8 +19,9 @@ use windows::core::{HSTRING, Result, w};
 
 const TIMER_POLL: usize = 1;
 const POLL_MS: u32 = 150;
-/// Posted by shutdown threads: wParam = child index.
+/// Posted by the shutdown thread: wParam = child index.
 const WM_APP_STOPPED: u32 = WM_APP + 1;
+const WM_APP_STOPPING: u32 = WM_APP + 2;
 
 const BG: COLORREF = rgb(24, 24, 24);
 const HEADER: COLORREF = rgb(45, 45, 48);
@@ -164,6 +165,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if with_ui(Ui::request_close).unwrap_or(true) {
                     let _ = DestroyWindow(hwnd);
                 }
+                LRESULT(0)
+            }
+            WM_APP_STOPPING => {
+                with_ui(|ui| ui.on_stopping(wp.0));
                 LRESULT(0)
             }
             WM_APP_STOPPED => {
@@ -330,27 +335,41 @@ impl Ui {
         unsafe {
             let _ = SetWindowTextW(self.hwnd, &HSTRING::from(format!("{} — shutting down…", self.title)));
         }
+        // Stop apps one at a time in reverse launch order: the first apps in the config
+        // are assumed to be the most important, so they stay up until everything
+        // launched after them has exited.
+        let plans: Vec<_> = self
+            .children
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .filter_map(|(i, c)| c.stop_plan(self.timeout_ms, &self.helper_exe).map(|p| (i, p)))
+            .collect();
+        self.pending_stops = plans.len();
         let host = self.hwnd.0 as isize;
-        for (i, c) in self.children.iter_mut().enumerate() {
-            if let Some(plan) = c.stop_plan(self.timeout_ms, &self.helper_exe) {
-                self.pending_stops += 1;
-                std::thread::spawn(move || {
-                    plan.run();
-                    unsafe {
-                        let _ = PostMessageW(
-                            Some(HWND(host as *mut _)),
-                            WM_APP_STOPPED,
-                            WPARAM(i),
-                            LPARAM(0),
-                        );
-                    }
-                });
+        std::thread::spawn(move || {
+            let post = |msg, i| unsafe {
+                let _ = PostMessageW(Some(HWND(host as *mut _)), msg, WPARAM(i), LPARAM(0));
+            };
+            for (i, plan) in plans {
+                post(WM_APP_STOPPING, i);
+                plan.run();
+                post(WM_APP_STOPPED, i);
             }
-        }
+        });
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
         self.pending_stops == 0 && self.release_all()
+    }
+
+    fn on_stopping(&mut self, index: usize) {
+        if let Some(c) = self.children.get_mut(index) {
+            c.begin_stop();
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
     }
 
     fn on_stopped(&mut self, index: usize) -> bool {
@@ -387,6 +406,7 @@ fn status_text(c: &Child) -> (String, COLORREF) {
         Status::Running => (format!("pid {}", c.pid), OK),
         Status::Exited(code) => (format!("exited ({code})"), if *code == 0 { DIM } else { BAD }),
         Status::Failed(e) => (format!("failed: {}", e.trim()), BAD),
+        Status::StopQueued => ("waiting to stop…".into(), DIM),
         Status::Stopping => ("stopping…".into(), WARN),
         Status::Stopped => ("stopped".into(), DIM),
     }

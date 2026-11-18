@@ -4,6 +4,10 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+### Changed
+
+- Shutdown stops apps one at a time in reverse config order, waiting for each to exit before the next, instead of all at once. Tiles waiting their turn show "waiting to stop…".
+
 ## [0.1.1] - 2026-11-17
 
 ### Changed

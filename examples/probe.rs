@@ -1,5 +1,7 @@
 //! Test child: prints a tick every second and records which console control event
-//! it received (to the file given as the first argument) before exiting.
+//! it received before exiting, as `<label> <event>` lines appended to a log file.
+//!
+//!     probe.exe <logfile> [label]    (label defaults to the pid)
 //!
 //!     cargo build --example probe
 
@@ -9,6 +11,7 @@ use windows::Win32::System::Console::*;
 use windows::core::BOOL;
 
 static LOG: OnceLock<String> = OnceLock::new();
+static LABEL: OnceLock<String> = OnceLock::new();
 
 unsafe extern "system" fn handler(event: u32) -> BOOL {
     let name = match event {
@@ -19,7 +22,8 @@ unsafe extern "system" fn handler(event: u32) -> BOOL {
     };
     if let Some(path) = LOG.get() {
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{} {name}", std::process::id());
+            let label = LABEL.get().cloned().unwrap_or_else(|| std::process::id().to_string());
+            let _ = writeln!(f, "{label} {name}");
         }
     }
     println!("got {name}, cleaning up...");
@@ -30,6 +34,9 @@ unsafe extern "system" fn handler(event: u32) -> BOOL {
 fn main() {
     if let Some(p) = std::env::args().nth(1) {
         let _ = LOG.set(p);
+    }
+    if let Some(l) = std::env::args().nth(2) {
+        let _ = LABEL.set(l);
     }
     unsafe { SetConsoleCtrlHandler(Some(handler), true).unwrap() };
     for i in 0.. {
