@@ -1,0 +1,25 @@
+# Copy to brady.toml (or pass a path: brady-bunch.exe my-layout.toml).
+
+title = "Brady Bunch"
+shutdown_timeout_ms = 5000   # per shutdown step, before escalating
+# columns = 3                # default: ceil(sqrt(number of apps))
+# maximized = true
+
+[[app]]
+name = "ping"
+command = "ping -t localhost"
+
+[[app]]
+name = "shell"
+command = "cmd.exe /k echo hello from brady-bunch"
+cwd = "C:\\"
+
+[[app]]
+command = "powershell.exe -NoLogo -NoExit -Command Get-Date"
+
+[[app]]
+name = "charmap"
+command = "charmap.exe"
+# shutdown = "auto"          # auto | ctrl-c | close | kill
+# console = false            # override console/GUI detection
+# shutdown_timeout_ms = 2000
