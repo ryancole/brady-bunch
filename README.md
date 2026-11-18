@@ -8,6 +8,17 @@ brady-bunch.exe [config.toml]
 
 The config defaults to `brady.toml` in the working directory, or next to the exe if there isn't one there. See [brady.example.toml](brady.example.toml).
 
+## Install
+
+Download the zip from [Releases](https://github.com/ryancole/brady-bunch/releases), extract it anywhere, and copy `brady.example.toml` to `brady.toml` next to the exe. The exe has no dependencies.
+
+To publish a release, bump `version` in `Cargo.toml`, commit, then push a matching tag:
+
+```
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Behaviour
 
 - **Launch:** each app runs in its own job object set to kill on close. If the host crashes or is force-killed, Windows kills every child and grandchild.

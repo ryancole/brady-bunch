@@ -1,0 +1,45 @@
+name: Release
+
+# Push a tag matching the Cargo.toml version to publish a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
+          }
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          $name = "brady-bunch-$env:GITHUB_REF_NAME-x86_64-windows"
+          New-Item -ItemType Directory "dist/$name" | Out-Null
+          Copy-Item target/release/brady-bunch.exe, brady.example.toml, README.md "dist/$name"
+          Compress-Archive "dist/$name/*" "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content "dist/$name.zip.sha256" "$hash  $name.zip" -NoNewline
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME (Get-ChildItem dist -File).FullName --title $env:GITHUB_REF_NAME --generate-notes
