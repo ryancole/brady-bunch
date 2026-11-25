@@ -4,6 +4,8 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-25
+
 ### Added
 
 - `depends_on = ["app", ...]` holds an app until those apps are ready. Waiting tiles show `waiting for <app>…`, and say why if the dependency is stuck.
