@@ -4,6 +4,13 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-25
+
+### Fixed
+
+- Apps waiting on a dependency started up to 4s after it was ready. Windows takes about 2s to refuse a connection to a closed port, and `localhost` is tried on both `::1` and `127.0.0.1`, so a failed `http` check (or `skip_if_ready` check) took about 4s, and a `tcp` check about 1s. Checks against a closed local port now fail in about 200ms.
+- A batch wrapper such as `solr.cmd` that stopped on Ctrl+C, leaving `cmd.exe` at `Terminate batch job (Y/N)?`, was logged as `stopped by close`. It's now `stopped by ctrl-c`, and the log says the leftover prompt was closed.
+
 ## [0.5.0] - 2026-11-25
 
 ### Added

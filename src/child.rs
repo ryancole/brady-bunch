@@ -682,6 +682,10 @@ impl StopPlan {
             (Shutdown::Kill, _) => &[],
         };
         let mut by = StopBy::Kill;
+        // Set when Ctrl+C stopped the app but left its cmd.exe behind, at a batch file's
+        // `Terminate batch job (Y/N)?` prompt. Closing that prompt doesn't count as
+        // the step that stopped the app.
+        let mut ctrlc_left_shell = false;
         if self.done() {
             by = StopBy::Exited;
         } else {
@@ -690,6 +694,8 @@ impl StopPlan {
                     Step::CtrlC => "ctrl-c",
                     Step::Close => "close",
                 };
+                // A plain cmd shell ignores Ctrl+C; only a program that was running counts.
+                let had_program = !self.job.only_shells_left();
                 match step {
                     Step::CtrlC => {
                         if !ctrlc::send_to_any(&self.helper_exe, &job_pids(self.job.handle.0)) {
@@ -707,14 +713,21 @@ impl StopPlan {
                 if self.wait(self.timeout, shells_count_as_stopped) {
                     by = match step {
                         Step::CtrlC => StopBy::CtrlC,
+                        Step::Close if ctrlc_left_shell => StopBy::CtrlC,
                         Step::Close => StopBy::Close,
                     };
                     break;
                 }
-                if !self.done() {
+                if shells_count_as_stopped && had_program && self.job.only_shells_left() {
+                    ctrlc_left_shell = true;
+                    events::log(format!("{}: ctrl-c stopped the app; closing the cmd.exe it left", self.name));
+                } else if !self.done() {
                     events::log(format!("{}: still running after {name}", self.name));
                 }
             }
+        }
+        if ctrlc_left_shell && by == StopBy::Kill {
+            by = StopBy::CtrlC; // Only the leftover prompt needed killing.
         }
         // Kill anything left: everything after a timeout, or the leftovers (and the
         // console kept open) once the app has exited.

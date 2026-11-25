@@ -4,7 +4,7 @@
 use crate::config::{ReadyConfig, TcpTarget};
 use regex_lite::Regex;
 use std::io::{Read, Seek, SeekFrom};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,9 +108,15 @@ pub fn spawn(mut check: Check, once: bool) -> ProbeGuard {
 
 fn tcp_ok(addr: &str) -> bool {
     // `localhost` resolves to both ::1 and 127.0.0.1; servers often listen on only one.
-    addr.to_socket_addrs()
-        .map(|addrs| addrs.into_iter().any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok()))
-        .unwrap_or(false)
+    addr.to_socket_addrs().map(|addrs| addrs.into_iter().any(connects)).unwrap_or(false)
+}
+
+/// Windows retries a refused connection for about 2s before failing, so a closed port
+/// would hold up every check (twice over for `localhost`). Cap the wait instead: on
+/// loopback, a listening port accepts at once.
+fn connects(a: SocketAddr) -> bool {
+    let timeout = Duration::from_millis(if a.ip().is_loopback() { 100 } else { 500 });
+    TcpStream::connect_timeout(&a, timeout).is_ok()
 }
 
 /// New output in the log file (from `offset` on) matches `re`. `tail` carries the end
@@ -176,6 +182,12 @@ fn http_status(url: &str) -> Option<u32> {
         let host = HSTRING::from_wide(&host[..parts.dwHostNameLength as usize]);
         let path = HSTRING::from_wide(&path[..parts.dwUrlPathLength as usize]);
         let secure = parts.nScheme == WINHTTP_INTERNET_SCHEME_HTTPS;
+        // WinHTTP waits out Windows' retries on a closed port; check it's open first.
+        let host_name = host.to_string_lossy();
+        let host_name = host_name.trim_start_matches('[').trim_end_matches(']');
+        if !(host_name, parts.nPort).to_socket_addrs().is_ok_and(|mut addrs| addrs.any(connects)) {
+            return None;
+        }
 
         let session = Internet(WinHttpOpen(
             w!("brady-bunch"),
@@ -248,14 +260,31 @@ mod tests {
     }
 
     #[test]
+    fn closed_ports_fail_fast() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let start = std::time::Instant::now();
+        assert!(!tcp_ok(&format!("localhost:{port}")));
+        assert!(!http_ok(&format!("http://localhost:{port}/")));
+        assert!(start.elapsed() < Duration::from_millis(1000), "took {:?}", start.elapsed());
+    }
+
+    #[test]
     fn http_check_accepts_any_status_below_500() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
-            for status in ["404 Not Found", "503 Service Unavailable"] {
+            let mut statuses = ["404 Not Found", "503 Service Unavailable"].into_iter().peekable();
+            while let Some(status) = statuses.peek() {
                 let (mut s, _) = l.accept().unwrap();
                 let mut buf = [0u8; 1024];
-                let _ = s.read(&mut buf);
+                // The port check before each request connects and sends nothing.
+                if s.read(&mut buf).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let status = *status;
+                statuses.next();
                 let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             }
         });

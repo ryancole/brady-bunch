@@ -178,7 +178,7 @@ Config rules:
 - Quote an exe path containing spaces inside `command`, as shown above. The command line reaches the program exactly as written, including nested quotes such as `cmd /c ""%TOOL%" --flag"`.
 - **Finding the exe:** a path is relative to the app's `cwd`. A bare name is looked for in the app's `cwd`, then on PATH as the app will see it (so `env = { PATH = ... }` counts). `.exe` is added if the name has no extension. If it isn't found, the tile shows `failed: <name> not found...` and nothing is launched.
 - Only real `.exe` files and `.bat`/`.cmd` files launch directly. Run wrappers without an extension (`npm`, `npx`, `yarn`, `pnpm`), shell builtins and pipelines through `cmd /c`: `command = 'cmd /c "npm run build && npm start"'`.
-- After Ctrl+C, a batch wrapper may stop at `Terminate batch job (Y/N)?`. That's handled: once only `cmd.exe` and console plumbing are left in the app, brady-bunch closes the console right away instead of waiting out the timeout.
+- After Ctrl+C, a batch wrapper may stop at `Terminate batch job (Y/N)?`. That's handled: once only `cmd.exe` and console plumbing are left in the app, brady-bunch closes the console right away instead of waiting out the timeout. The app still counts as stopped by `ctrl-c`.
 
 ## Startup order
 
