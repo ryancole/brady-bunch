@@ -4,6 +4,18 @@ title = "Brady Bunch"
 shutdown_timeout_ms = 5000   # per shutdown step, before escalating
 # columns = 3                # default: ceil(sqrt(number of apps))
 # maximized = true
+# event_log = 'brady-events.log'   # launches, exits, readiness, each shutdown step
+
+# Per-app keys shared by every [[app]]; an app's own value wins.
+# [defaults]
+# exit_with = "main"
+# shutdown_timeout_ms = 30000
+# env = { DOTNET_ENVIRONMENT = "Development" }
+
+# Setup steps: run one at a time, each to completion, before any [[app]] starts.
+# [[task]]
+# name = "build"
+# command = 'dotnet build src\App.sln -nodeReuse:false'
 
 [[app]]
 name = "ping"
@@ -24,6 +36,12 @@ command = "charmap.exe"
 # console = false            # override console/GUI detection
 # shutdown_timeout_ms = 2000
 # exit_with = "all"          # all | main; use main for `dotnet run` and other tools that leave servers running
-# env = { DOTNET_ENVIRONMENT = "Development" }
+# env = { DOTNET_ENVIRONMENT = "Development", PATH = 'C:\tools;%PATH%' }   # %VAR% is expanded
 # restart = "never"          # never | on-failure | always
 # restart_delay_ms = 1000    # doubles up to 30s while the app keeps exiting quickly
+# depends_on = ["ping"]      # start once these apps are ready
+# ready = { tcp = 8080 }     # or { http = "https://localhost:8002" } or { log = 'Now listening on' }; plus timeout_ms
+# skip_if_ready = true       # don't launch if the ready check already passes (started elsewhere)
+# log = 'logs\charmap.log'   # copy console output to a file
+# quick_edit = true          # allow mouse selection in the console (off by default)
+# url = "http://localhost:8080"   # link in the tile header

@@ -1,10 +1,10 @@
 #![windows_subsystem = "windows"]
 
-mod child;
-mod config;
-mod ctrlc;
-
-use child::{Child, Status};
+use brady_bunch::{child, config, control, ctrlc, events, ready};
+use child::{Child, Readiness, Status, StopBy, StopOutcome};
+use control::{Cmd, Request, WM_APP_CONTROL};
+use ready::Check;
+use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use windows::Win32::Foundation::*;
@@ -15,14 +15,17 @@ use windows::Win32::UI::HiDpi::{
     SystemParametersInfoForDpi,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{HSTRING, Result, w};
+use windows::core::{HSTRING, PCWSTR, Result, w};
 
 const TIMER_POLL: usize = 1;
 const POLL_MS: u32 = 150;
-/// Posted by the shutdown thread: wParam = child index.
+/// Posted by the shutdown thread: wParam = child index, lParam = encoded StopOutcome.
 const WM_APP_STOPPED: u32 = WM_APP + 1;
 const WM_APP_STOPPING: u32 = WM_APP + 2;
+/// Posted when a stop requested with `--stop`/`--restart` has finished.
+const WM_APP_MANUAL_STOPPED: u32 = WM_APP + 3;
 
 const BG: COLORREF = rgb(24, 24, 24);
 const HEADER: COLORREF = rgb(45, 45, 48);
@@ -34,6 +37,7 @@ const DIM: COLORREF = rgb(150, 150, 150);
 const OK: COLORREF = rgb(110, 200, 120);
 const WARN: COLORREF = rgb(230, 180, 80);
 const BAD: COLORREF = rgb(235, 100, 100);
+const LINK: COLORREF = rgb(120, 175, 255);
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
@@ -42,18 +46,30 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 struct Ui {
     hwnd: HWND,
     title: String,
+    config_path: PathBuf,
     columns: Option<u32>,
     timeout_ms: u64,
     helper_exe: PathBuf,
     children: Vec<Child>,
+    /// For each child, the children it waits for.
+    deps: Vec<Vec<usize>>,
     shutting_down: bool,
     pending_stops: usize,
+    /// Stops requested from the command line that haven't finished.
+    manual_stops: usize,
+    /// Start the child again once its requested stop finishes (`--restart`).
+    start_after_stop: Vec<bool>,
     /// Tile shown alone, filling the window; toggled by double-clicking a tile header.
     zoomed: Option<usize>,
     /// Tile whose window last received keyboard focus; restored when the host is reactivated.
     focused: Option<usize>,
+    /// Which tiles were in the grid at the last layout.
+    shown: Vec<bool>,
+    /// Header links drawn in the last paint: (child, rect).
+    links: Vec<(usize, RECT)>,
     dpi: u32,
     font: HFONT,
+    link_font: HFONT,
 }
 
 thread_local! {
@@ -68,19 +84,58 @@ fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some(ctrlc::HELPER_FLAG) {
-        let pid = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-        std::process::exit(ctrlc::helper_main(pid));
+    let flag = args.get(1).map(String::as_str).unwrap_or("");
+    let num = |i: usize| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if flag == ctrlc::HELPER_FLAG {
+        std::process::exit(ctrlc::helper_main(num(2)));
+    }
+    if flag == ctrlc::READ_FLAG {
+        std::process::exit(ctrlc::read_main(num(2), num(3)));
+    }
+    if control::VERBS.contains(&flag) {
+        std::process::exit(control::client_main(&args[1..]));
     }
 
-    let path = config::resolve_path(args.get(1).map(PathBuf::from));
-    let cfg = match config::load(&path) {
+    let (path, sel) = match parse_launch_args(&args[1..]) {
+        Ok(a) => a,
+        Err(e) => fatal(&e),
+    };
+    let path = config::resolve_path(path);
+    let cfg = match config::load(&path, &sel) {
         Ok(c) => c,
         Err(e) => fatal(&e),
     };
-    if let Err(e) = unsafe { run(cfg) } {
+    if let Some(log) = &cfg.event_log
+        && let Err(e) = events::init(log)
+    {
+        fatal(&format!("Could not create event_log {}: {e}", log.display()));
+    }
+    events::log(format!("host started (pid {}) with {}", std::process::id(), path.display()));
+    if let Err(e) = unsafe { run(cfg, path) } {
         fatal(&e.message());
     }
+    events::log("host exiting");
+}
+
+/// `[config] [--only a,b] [--skip c,d]`
+fn parse_launch_args(args: &[String]) -> std::result::Result<(Option<PathBuf>, config::Selection), String> {
+    let mut path = None;
+    let mut sel = config::Selection::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let list = |v: Option<&String>| -> std::result::Result<Vec<String>, String> {
+            let v = v.ok_or_else(|| format!("{a} needs a comma-separated list of app names"))?;
+            Ok(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        };
+        match a.as_str() {
+            "--only" => sel.only.extend(list(it.next())?),
+            "--skip" => sel.skip.extend(list(it.next())?),
+            s if s.starts_with("--") => return Err(format!("Unknown option {s}.")),
+            _ if path.is_none() => path = Some(PathBuf::from(a)),
+            _ => return Err(format!("Unexpected argument {a}.")),
+        }
+    }
+    Ok((path, sel))
 }
 
 fn fatal(msg: &str) -> ! {
@@ -90,7 +145,7 @@ fn fatal(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-unsafe fn run(cfg: config::Config) -> Result<()> {
+unsafe fn run(cfg: config::Loaded, config_path: PathBuf) -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let instance = GetModuleHandleW(None)?;
@@ -122,23 +177,36 @@ unsafe fn run(cfg: config::Config) -> Result<()> {
         )?;
 
         let dpi = GetDpiForWindow(hwnd);
-        let children = cfg.apps.iter().map(Child::spawn).collect();
+        let helper_exe = std::env::current_exe().unwrap_or_default();
+        let shim = helper_exe.parent().map(|d| d.join(child::SHIM_EXE)).filter(|p| p.is_file());
+        let ctx = child::Context { shim };
+        let children: Vec<Child> = cfg.entries.iter().enumerate().map(|(i, e)| Child::new(i, e, &ctx)).collect();
+        let n = children.len();
         UI.with(|cell| {
             *cell.borrow_mut() = Some(Ui {
                 hwnd,
                 title: cfg.title.clone(),
+                config_path: std::path::absolute(&config_path).unwrap_or(config_path.clone()),
                 columns: cfg.columns,
                 timeout_ms: cfg.shutdown_timeout_ms,
-                helper_exe: std::env::current_exe().unwrap_or_default(),
+                helper_exe: helper_exe.clone(),
                 children,
+                deps: cfg.deps.clone(),
                 shutting_down: false,
                 pending_stops: 0,
+                manual_stops: 0,
+                start_after_stop: vec![false; n],
                 zoomed: None,
                 focused: None,
+                shown: Vec::new(),
+                links: Vec::new(),
                 dpi,
-                font: message_font(dpi),
+                font: message_font(dpi, false),
+                link_font: message_font(dpi, true),
             })
         });
+        with_ui(Ui::gate);
+        control::serve(hwnd, &config_path, helper_exe);
 
         let _ = ShowWindow(hwnd, if cfg.maximized { SW_SHOWMAXIMIZED } else { SW_SHOWDEFAULT });
         SetTimer(Some(hwnd), TIMER_POLL, POLL_MS, None);
@@ -149,9 +217,26 @@ unsafe fn run(cfg: config::Config) -> Result<()> {
             DispatchMessageW(&msg);
         }
         // Dropping the UI closes the job handles; KILL_ON_JOB_CLOSE reaps anything left.
-        UI.with(|cell| cell.borrow_mut().take());
+        UI.with(|cell| {
+            if let Some(ui) = cell.borrow_mut().as_mut() {
+                ui.children.iter_mut().for_each(Child::cleanup);
+            }
+            cell.borrow_mut().take()
+        });
         Ok(())
     }
+}
+
+fn point(lp: LPARAM) -> POINT {
+    POINT { x: lp.0 as i16 as i32, y: (lp.0 >> 16) as i16 as i32 }
+}
+
+fn encode_outcome(o: StopOutcome) -> isize {
+    (o.by.index() as isize) | ((o.ms.min(i32::MAX as u64) as isize) << 4)
+}
+
+fn decode_outcome(lp: LPARAM) -> StopOutcome {
+    StopOutcome { by: StopBy::from_index((lp.0 & 0xF) as usize), ms: (lp.0 >> 4) as u64 }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -174,8 +259,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_PARENTNOTIFY
                 if matches!((wp.0 & 0xFFFF) as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) =>
             {
-                let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
-                if let Some(target) = with_ui(|ui| ui.focus_target_at(POINT { x, y })).flatten() {
+                if let Some(target) = with_ui(|ui| ui.focus_target_at(point(lp))).flatten() {
                     let _ = SetFocus(Some(target));
                 }
                 LRESULT(0)
@@ -195,20 +279,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
-                let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
-                with_ui(|ui| ui.toggle_zoom_at(POINT { x, y }));
+                with_ui(|ui| ui.toggle_zoom_at(point(lp)));
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
-                with_ui(|ui| ui.click(POINT { x, y }));
+                with_ui(|ui| ui.click(point(lp)));
                 LRESULT(0)
             }
             WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 let _ = ScreenToClient(hwnd, &mut pt);
-                if with_ui(|ui| ui.restartable_at(pt).is_some()).unwrap_or(false)
+                if with_ui(|ui| ui.link_at(pt).is_some() || ui.restartable_at(pt).is_some()).unwrap_or(false)
                     && let Ok(hand) = LoadCursorW(None, IDC_HAND)
                 {
                     SetCursor(Some(hand));
@@ -228,9 +310,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_APP_STOPPED => {
-                if with_ui(|ui| ui.on_stopped(wp.0)).unwrap_or(false) {
+                if with_ui(|ui| ui.on_stopped(wp.0, decode_outcome(lp))).unwrap_or(false) {
                     let _ = DestroyWindow(hwnd);
                 }
+                LRESULT(0)
+            }
+            WM_APP_MANUAL_STOPPED => {
+                if with_ui(|ui| ui.on_manual_stopped(wp.0, decode_outcome(lp))).unwrap_or(false) {
+                    let _ = DestroyWindow(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_APP_CONTROL => {
+                // SAFETY: posted by control::ask with a leaked Box<Request>.
+                let req = Box::from_raw(lp.0 as *mut Request);
+                let Request { cmd, reply } = *req;
+                let result = with_ui(|ui| ui.control(cmd)).unwrap_or_else(|| Err("the host is busy; try again".into()));
+                let _ = reply.send(result);
                 LRESULT(0)
             }
             WM_DPICHANGED => {
@@ -261,6 +357,12 @@ impl Ui {
         px * self.dpi as i32 / 96
     }
 
+    fn invalidate(&self) {
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
     fn poll(&mut self) {
         let (mut repaint, mut relayout) = (false, false);
         for c in &mut self.children {
@@ -268,25 +370,57 @@ impl Ui {
             repaint |= p;
             relayout |= l;
         }
-        if relayout {
+        repaint |= self.gate();
+        if relayout || self.shown_tiles() != self.shown {
             self.layout();
         }
         if repaint {
-            unsafe {
-                let _ = InvalidateRect(Some(self.hwnd), None, false);
-            }
+            self.invalidate();
         }
     }
 
+    /// Launch every waiting child whose dependencies are ready. Returns true if any started.
+    fn gate(&mut self) -> bool {
+        if self.shutting_down {
+            return false;
+        }
+        let mut any = false;
+        // Launching an app without a `ready` check makes it ready at once, which can
+        // release the apps that depend on it, so repeat until nothing changes.
+        loop {
+            let next = (0..self.children.len()).find(|&i| {
+                self.children[i].status == Status::Waiting && self.deps[i].iter().all(|&d| self.children[d].is_ready())
+            });
+            let Some(i) = next else { return any };
+            self.children[i].launch();
+            any = true;
+        }
+    }
+
+    /// The task shown while setup runs: the first one that hasn't finished.
+    fn current_task(&self) -> Option<usize> {
+        (0..self.children.len()).find(|&i| self.children[i].cfg.task && !self.children[i].is_done())
+    }
+
+    /// Whether each tile is in the grid: apps always, tasks only while running setup.
+    fn shown_tiles(&self) -> Vec<bool> {
+        let task = self.current_task();
+        (0..self.children.len()).map(|i| !self.children[i].cfg.task || Some(i) == task).collect()
+    }
+
     /// Tile rects for each child: a near-square grid; a short last row stretches to fill.
+    /// Tiles that aren't shown get an empty rect.
     fn cells(&self) -> Vec<RECT> {
-        let n = self.children.len();
+        let shown = self.shown_tiles();
+        let visible: Vec<usize> = (0..shown.len()).filter(|&i| shown[i]).collect();
+        let n = visible.len();
         let mut client = RECT::default();
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut client);
         }
+        let mut out = vec![RECT::default(); self.children.len()];
         if n == 0 {
-            return Vec::new();
+            return out;
         }
         let cols = self
             .columns
@@ -294,16 +428,20 @@ impl Ui {
             .unwrap_or_else(|| (n as f64).sqrt().ceil() as usize)
             .clamp(1, n);
         let (margin, gap) = (self.scale(MARGIN), self.scale(GAP));
-        if let Some(z) = self.zoomed {
-            let full = grid(client, 1, 1, margin, gap)[0];
-            return (0..n).map(|i| if i == z { full } else { RECT::default() }).collect();
+        if let Some(z) = self.zoomed.filter(|&z| shown.get(z) == Some(&true)) {
+            out[z] = grid(client, 1, 1, margin, gap)[0];
+            return out;
         }
-        grid(client, n, cols, margin, gap)
+        for (rect, &i) in grid(client, n, cols, margin, gap).into_iter().zip(&visible) {
+            out[i] = rect;
+        }
+        out
     }
 
-    /// True if another tile is zoomed, so this one isn't shown.
+    /// True if the tile isn't drawn: another tile is zoomed, or it's a task not running.
     fn is_hidden(&self, index: usize) -> bool {
-        self.zoomed.is_some_and(|z| z != index)
+        let shown = self.shown_tiles();
+        !shown[index] || self.zoomed.is_some_and(|z| z != index && shown.get(z) == Some(&true))
     }
 
     /// The embedded window under `pt` (host client coordinates), now marked as focused.
@@ -314,9 +452,7 @@ impl Ui {
         let hwnd = self.children[i].window.as_ref()?.hwnd;
         if self.focused != Some(i) {
             self.focused = Some(i);
-            unsafe {
-                let _ = InvalidateRect(Some(self.hwnd), None, false);
-            }
+            self.invalidate();
         }
         Some(hwnd)
     }
@@ -333,9 +469,7 @@ impl Ui {
     fn clear_focus(&mut self) -> bool {
         let had = self.focused.take().is_some();
         if had {
-            unsafe {
-                let _ = InvalidateRect(Some(self.hwnd), None, false);
-            }
+            self.invalidate();
         }
         had
     }
@@ -370,6 +504,7 @@ impl Ui {
     }
 
     fn layout(&mut self) {
+        self.shown = self.shown_tiles();
         let cells = self.cells();
         for (i, (c, cell)) in self.children.iter().zip(&cells).enumerate() {
             if let Some(w) = &c.window {
@@ -394,12 +529,12 @@ impl Ui {
                 }
             }
         }
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
-        }
+        self.invalidate();
     }
 
     fn paint(&mut self) {
+        let cells = self.cells();
+        let mut links = Vec::new();
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
@@ -414,32 +549,36 @@ impl Ui {
             SetBkMode(hdc, TRANSPARENT);
             let pad = self.scale(8);
 
-            for (i, (c, cell)) in self.children.iter().zip(self.cells()).enumerate() {
+            for (i, cell) in cells.iter().enumerate() {
                 if self.is_hidden(i) {
                     continue;
                 }
-                let (h, b) = self.split(&cell);
+                let c = &self.children[i];
+                let (h, b) = self.split(cell);
                 FillRect(hdc, &h, if self.focused == Some(i) { header_focused } else { header });
                 let text_rc = RECT { left: h.left + pad, right: h.right - pad, ..h };
-                let (status, color) = status_text(c);
+                let (status, color) = self.status_text(i);
+                let status_w = text_width(hdc, &status).min((text_rc.right - text_rc.left) / 2);
                 draw_text(hdc, &status, text_rc, color, DT_RIGHT);
-                let name_rc = RECT { right: text_rc.right - self.scale(140), ..text_rc };
+                let name_rc = RECT { right: text_rc.right - status_w - pad, ..text_rc };
                 draw_text(hdc, &c.name, name_rc, TEXT, DT_LEFT);
+                if let Some(url) = &c.cfg.url {
+                    let left = name_rc.left + text_width(hdc, &c.name) + pad;
+                    let right = (left + text_width_font(hdc, url, self.link_font)).min(name_rc.right);
+                    if right - left > self.scale(24) {
+                        let rc = RECT { left, right, ..name_rc };
+                        SelectObject(hdc, self.link_font.into());
+                        draw_text(hdc, url, rc, LINK, DT_LEFT);
+                        SelectObject(hdc, self.font.into());
+                        links.push((i, rc));
+                    }
+                }
                 if self.zoomed.is_some() {
                     draw_text(hdc, "double-click to restore the grid", text_rc, DIM, DT_CENTER);
                 }
                 if c.window.is_none() {
                     FillRect(hdc, &b, panel);
-                    let hint = if self.shutting_down {
-                        None
-                    } else if let Some(secs) = c.restart_in_secs() {
-                        Some((format!("Restarting in {secs}s… (click to restart now)"), WARN))
-                    } else if c.can_restart() {
-                        Some(("Click to restart".to_string(), TEXT))
-                    } else {
-                        None
-                    };
-                    match hint {
+                    match self.body_hint(i) {
                         Some((hint, color)) => {
                             let mid = (b.top + b.bottom) / 2;
                             let line = self.scale(12);
@@ -457,9 +596,74 @@ impl Ui {
             }
             let _ = EndPaint(self.hwnd, &ps);
         }
+        self.links = links;
     }
 
-    /// Index of the tile under `pt` if clicking it would restart its app.
+    /// The first dependency of child `i` that isn't ready, with why, e.g. `solr (not ready)`.
+    fn waiting_for(&self, i: usize) -> Option<String> {
+        let d = *self.deps[i].iter().find(|&&d| !self.children[d].is_ready())?;
+        let dep = &self.children[d];
+        let why = match &dep.status {
+            Status::Exited(code) => format!(" (exited with code {code})"),
+            Status::Failed(_) => " (failed to launch)".into(),
+            Status::Stopped => " (stopped)".into(),
+            Status::WaitingForWindow | Status::Running if dep.readiness == Readiness::TimedOut => {
+                " (not ready)".into()
+            }
+            _ => String::new(),
+        };
+        Some(format!("{}{why}", dep.name))
+    }
+
+    fn status_text(&self, i: usize) -> (String, COLORREF) {
+        let c = &self.children[i];
+        let countdown = c.restart_in_secs().map(|s| format!(", restarting in {s}s")).unwrap_or_default();
+        match &c.status {
+            Status::Waiting => match self.waiting_for(i) {
+                Some(w) => (format!("waiting for {w}…"), WARN),
+                None => ("starting…".into(), WARN),
+            },
+            Status::Checking => ("checking…".into(), WARN),
+            Status::External => ("already running".into(), OK),
+            Status::WaitingForWindow | Status::Running => match (c.readiness, c.window.is_some()) {
+                (Readiness::Pending, true) => (format!("starting… (pid {})", c.pid), WARN),
+                (Readiness::TimedOut, _) => (format!("not ready (pid {})", c.pid), BAD),
+                (_, true) => (format!("pid {}", c.pid), OK),
+                (_, false) => ("starting…".into(), WARN),
+            },
+            Status::Exited(0) if c.cfg.task => ("done".into(), OK),
+            Status::Exited(code) => (format!("exited ({code}){countdown}"), if *code == 0 { DIM } else { BAD }),
+            Status::Failed(e) => (format!("failed: {}{countdown}", e.trim()), BAD),
+            Status::Stopped => ("stopped".into(), DIM),
+            Status::StopQueued => ("waiting to stop…".into(), DIM),
+            Status::Stopping => ("stopping…".into(), WARN),
+        }
+    }
+
+    /// Text in the body of a tile with no window.
+    fn body_hint(&self, i: usize) -> Option<(String, COLORREF)> {
+        if self.shutting_down {
+            return None;
+        }
+        let c = &self.children[i];
+        match &c.status {
+            Status::Waiting => self.waiting_for(i).map(|w| (format!("Waiting for {w}"), WARN)),
+            Status::Checking => Some(("Checking whether it's already running…".into(), WARN)),
+            Status::External => {
+                let what = c.cfg.ready.as_ref().map(Check::describe).unwrap_or_default();
+                Some((format!("Already running ({what} answered), so not launched. Click to check again."), OK))
+            }
+            Status::Stopped => Some(("Stopped. Click to start.".into(), TEXT)),
+            _ if c.restart_in_secs().is_some() => Some((
+                format!("Restarting in {}s… (click to restart now)", c.restart_in_secs().unwrap_or(0)),
+                WARN,
+            )),
+            _ if c.can_restart() => Some(("Click to restart".into(), TEXT)),
+            _ => None,
+        }
+    }
+
+    /// Index of the tile under `pt` if clicking it would start its app.
     fn restartable_at(&self, pt: POINT) -> Option<usize> {
         if self.shutting_down {
             return None;
@@ -468,56 +672,224 @@ impl Ui {
         self.cells()
             .iter()
             .position(|cell| contains(&self.split(cell).1, pt))
-            .filter(|&i| !self.is_hidden(i) && self.children[i].can_restart())
+            .filter(|&i| !self.is_hidden(i) && self.children[i].window.is_none() && self.children[i].can_restart())
+    }
+
+    fn link_at(&self, pt: POINT) -> Option<usize> {
+        self.links.iter().find(|(_, rc)| contains(rc, pt)).map(|(i, _)| *i)
     }
 
     fn click(&mut self, pt: POINT) {
-        if let Some(i) = self.restartable_at(pt) {
-            self.children[i].restart();
-            unsafe {
-                let _ = InvalidateRect(Some(self.hwnd), None, false);
+        if let Some(i) = self.link_at(pt) {
+            if let Some(url) = &self.children[i].cfg.url {
+                unsafe {
+                    ShellExecuteW(Some(self.hwnd), w!("open"), &HSTRING::from(url), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                }
             }
+            return;
+        }
+        if let Some(i) = self.restartable_at(pt) {
+            self.children[i].request_start();
+            self.gate();
+            self.invalidate();
         }
     }
+
+    // ---- Command-line control ----
+
+    fn find(&self, name: &str) -> std::result::Result<usize, String> {
+        let hits: Vec<usize> =
+            (0..self.children.len()).filter(|&i| self.children[i].name.eq_ignore_ascii_case(name.trim())).collect();
+        match hits[..] {
+            [i] => Ok(i),
+            [] => {
+                let all: Vec<&str> = self.children.iter().map(|c| c.name.as_str()).collect();
+                Err(format!("no app called \"{name}\"; the apps are: {}", all.join(", ")))
+            }
+            _ => Err(format!("more than one app is called \"{name}\"")),
+        }
+    }
+
+    fn control(&mut self, cmd: Cmd) -> std::result::Result<Value, String> {
+        let refuse = |ui: &Ui| if ui.shutting_down { Err("the host is shutting down".to_string()) } else { Ok(()) };
+        let r = match cmd {
+            Cmd::Status => return Ok(self.status_json()),
+            Cmd::App(name) => return self.find(&name).map(|i| self.app_json(i)),
+            Cmd::ConsolePids(name) => return self.find(&name).map(|i| json!(self.children[i].console_pids())),
+            Cmd::Start(name) => {
+                refuse(self)?;
+                let i = self.find(&name)?;
+                events::log(format!("{}: start requested", self.children[i].name));
+                if !matches!(self.children[i].status, Status::StopQueued | Status::Stopping) {
+                    self.children[i].request_start();
+                }
+                i
+            }
+            Cmd::Stop(name) => {
+                refuse(self)?;
+                let i = self.find(&name)?;
+                events::log(format!("{}: stop requested", self.children[i].name));
+                self.stop_one(i, false);
+                i
+            }
+            Cmd::Restart(name) => {
+                refuse(self)?;
+                let i = self.find(&name)?;
+                events::log(format!("{}: restart requested", self.children[i].name));
+                self.stop_one(i, true);
+                i
+            }
+        };
+        self.gate();
+        self.invalidate();
+        Ok(self.app_json(r))
+    }
+
+    /// Stop one app on request, then start it again if `then_start`.
+    fn stop_one(&mut self, i: usize, then_start: bool) {
+        let c = &mut self.children[i];
+        if matches!(c.status, Status::StopQueued | Status::Stopping) {
+            self.start_after_stop[i] |= then_start;
+            return;
+        }
+        match c.stop_plan(self.timeout_ms, &self.helper_exe) {
+            Some(plan) => {
+                c.begin_stop();
+                self.start_after_stop[i] = then_start;
+                self.manual_stops += 1;
+                let host = self.hwnd.0 as isize;
+                std::thread::spawn(move || {
+                    let outcome = plan.run();
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(host as *mut _)),
+                            WM_APP_MANUAL_STOPPED,
+                            WPARAM(i),
+                            LPARAM(encode_outcome(outcome)),
+                        );
+                    }
+                });
+            }
+            None if then_start => c.request_start(),
+            None => c.status = Status::Stopped,
+        }
+    }
+
+    fn on_manual_stopped(&mut self, index: usize, outcome: StopOutcome) -> bool {
+        self.manual_stops = self.manual_stops.saturating_sub(1);
+        if let Some(c) = self.children.get_mut(index) {
+            c.finish_stop(outcome);
+        }
+        self.invalidate();
+        if self.shutting_down {
+            return self.on_stopped(usize::MAX, outcome);
+        }
+        if std::mem::take(&mut self.start_after_stop[index]) {
+            self.children[index].request_start();
+            self.gate();
+        }
+        self.layout();
+        false
+    }
+
+    fn status_json(&self) -> Value {
+        json!({
+            "host_pid": std::process::id(),
+            "config": self.config_path.to_string_lossy(),
+            "title": self.title,
+            "shutting_down": self.shutting_down,
+            "apps": (0..self.children.len()).map(|i| self.app_json(i)).collect::<Vec<_>>(),
+        })
+    }
+
+    fn app_json(&self, i: usize) -> Value {
+        let c = &self.children[i];
+        let check = c.cfg.ready.as_ref().map(Check::describe);
+        let (state, reason): (&str, Option<String>) = match &c.status {
+            Status::Waiting => ("waiting", self.waiting_for(i).map(|w| format!("waiting for {w}"))),
+            Status::Checking => ("checking", check.map(|w| format!("checking whether {w} already answers"))),
+            Status::External => ("external", check.map(|w| format!("{w} already answered, so it wasn't launched"))),
+            Status::WaitingForWindow | Status::Running => match c.readiness {
+                Readiness::Pending => ("starting", check.map(|w| format!("waiting for {w}"))),
+                Readiness::TimedOut => (
+                    "not-ready",
+                    check.map(|w| format!("{w} didn't pass within {} ms", c.cfg.ready_timeout_ms())),
+                ),
+                _ => ("running", None),
+            },
+            Status::Exited(0) if c.cfg.task => ("done", None),
+            Status::Exited(code) => ("exited", Some(format!("exited with code {code}"))),
+            Status::Failed(e) => ("failed", Some(e.clone())),
+            Status::Stopped => (
+                "stopped",
+                c.last_stop.map(|s| format!("stopped by {} after {} ms", s.by.as_str(), s.ms)),
+            ),
+            Status::StopQueued | Status::Stopping => ("stopping", None),
+        };
+        let exit_code = match c.status {
+            Status::Exited(code) => Some(code),
+            _ => None,
+        };
+        let running = c.is_active() || matches!(c.status, Status::StopQueued | Status::Stopping);
+        json!({
+            "name": c.name,
+            "task": c.cfg.task,
+            "state": state,
+            "ready": c.is_ready(),
+            "reason": reason,
+            "pid": running.then_some(c.pid),
+            "exit_code": exit_code,
+            "restarts": c.restarts,
+            "restart_in_ms": c.restart_at.map(|t| t.saturating_duration_since(std::time::Instant::now()).as_millis() as u64),
+            "depends_on": self.deps[i].iter().map(|&d| self.children[d].name.as_str()).collect::<Vec<_>>(),
+            "command": c.cfg.command,
+            "url": c.cfg.url,
+            "log": c.cfg.log,
+            "last_stop": c.last_stop.map(|s| json!({ "by": s.by.as_str(), "ms": s.ms })),
+        })
+    }
+
+    // ---- Shutdown ----
 
     /// Start graceful shutdown. Returns true if the window can be destroyed now.
     fn request_close(&mut self) -> bool {
         if self.shutting_down {
             // Second close request: stop waiting and kill everything.
+            events::log("second close request: killing everything");
             for c in &self.children {
                 c.kill();
             }
             return false;
         }
         self.shutting_down = true;
+        events::log("shutdown requested");
         unsafe {
             let _ = SetWindowTextW(self.hwnd, &HSTRING::from(format!("{} — shutting down…", self.title)));
         }
-        // Stop apps one at a time in reverse launch order: the first apps in the config
-        // are assumed to be the most important, so they stay up until everything
-        // launched after them has exited.
-        let plans: Vec<_> = self
-            .children
-            .iter_mut()
-            .enumerate()
-            .rev()
-            .filter_map(|(i, c)| c.stop_plan(self.timeout_ms, &self.helper_exe).map(|p| (i, p)))
-            .collect();
-        self.pending_stops = plans.len();
+        // Stop apps one at a time, each after everything that depends on it: reverse
+        // start order, so the first apps in the config stay up longest.
+        let order = config::start_order(&self.deps);
+        let mut plans = Vec::new();
+        for &i in order.iter().rev() {
+            if let Some(p) = self.children[i].stop_plan(self.timeout_ms, &self.helper_exe) {
+                plans.push((i, p));
+            }
+        }
+        // Stops requested from the command line are still running; wait for them too.
+        self.pending_stops = plans.len() + self.manual_stops;
         let host = self.hwnd.0 as isize;
         std::thread::spawn(move || {
-            let post = |msg, i| unsafe {
-                let _ = PostMessageW(Some(HWND(host as *mut _)), msg, WPARAM(i), LPARAM(0));
+            let post = |msg, i, lp| unsafe {
+                let _ = PostMessageW(Some(HWND(host as *mut _)), msg, WPARAM(i), LPARAM(lp));
             };
             for (i, plan) in plans {
-                post(WM_APP_STOPPING, i);
-                plan.run();
-                post(WM_APP_STOPPED, i);
+                post(WM_APP_STOPPING, i, 0);
+                events::log(format!("{}: stopping", plan.name));
+                let outcome = plan.run();
+                post(WM_APP_STOPPED, i, encode_outcome(outcome));
             }
         });
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
-        }
+        self.invalidate();
         self.pending_stops == 0 && self.release_all()
     }
 
@@ -525,19 +897,15 @@ impl Ui {
         if let Some(c) = self.children.get_mut(index) {
             c.begin_stop();
         }
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
-        }
+        self.invalidate();
     }
 
-    fn on_stopped(&mut self, index: usize) -> bool {
+    fn on_stopped(&mut self, index: usize, outcome: StopOutcome) -> bool {
         if let Some(c) = self.children.get_mut(index) {
-            c.finish_stop();
+            c.finish_stop(outcome);
         }
         self.pending_stops = self.pending_stops.saturating_sub(1);
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
-        }
+        self.invalidate();
         self.pending_stops == 0 && self.release_all()
     }
 
@@ -553,8 +921,10 @@ impl Ui {
         self.dpi = dpi;
         unsafe {
             let _ = DeleteObject(self.font.into());
+            let _ = DeleteObject(self.link_font.into());
         }
-        self.font = message_font(dpi);
+        self.font = message_font(dpi, false);
+        self.link_font = message_font(dpi, true);
     }
 }
 
@@ -594,18 +964,6 @@ fn contains(r: &RECT, pt: POINT) -> bool {
     pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
 }
 
-fn status_text(c: &Child) -> (String, COLORREF) {
-    match &c.status {
-        Status::WaitingForWindow => ("starting…".into(), WARN),
-        Status::Running => (format!("pid {}", c.pid), OK),
-        Status::Exited(code) => (format!("exited ({code})"), if *code == 0 { DIM } else { BAD }),
-        Status::Failed(e) => (format!("failed: {}", e.trim()), BAD),
-        Status::StopQueued => ("waiting to stop…".into(), DIM),
-        Status::Stopping => ("stopping…".into(), WARN),
-        Status::Stopped => ("stopped".into(), DIM),
-    }
-}
-
 unsafe fn draw_text(hdc: HDC, text: &str, mut rc: RECT, color: COLORREF, align: DRAW_TEXT_FORMAT) {
     let mut buf: Vec<u16> = text.encode_utf16().collect();
     unsafe {
@@ -614,7 +972,25 @@ unsafe fn draw_text(hdc: HDC, text: &str, mut rc: RECT, color: COLORREF, align: 
     }
 }
 
-fn message_font(dpi: u32) -> HFONT {
+fn text_width(hdc: HDC, text: &str) -> i32 {
+    let buf: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE::default();
+    unsafe {
+        let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
+    }
+    size.cx
+}
+
+fn text_width_font(hdc: HDC, text: &str, font: HFONT) -> i32 {
+    unsafe {
+        let old = SelectObject(hdc, font.into());
+        let w = text_width(hdc, text);
+        SelectObject(hdc, old);
+        w
+    }
+}
+
+fn message_font(dpi: u32, underline: bool) -> HFONT {
     unsafe {
         let mut m = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
         let _ = SystemParametersInfoForDpi(
@@ -624,6 +1000,7 @@ fn message_font(dpi: u32) -> HFONT {
             0,
             dpi,
         );
+        m.lfMessageFont.lfUnderline = underline as u8;
         CreateFontIndirectW(&m.lfMessageFont)
     }
 }
@@ -655,5 +1032,22 @@ mod tests {
     #[test]
     fn single_tile_fills_inside_margin() {
         assert_eq!(grid(rect(0, 0, 220, 120), 1, 1, 10, 8), [rect(10, 10, 210, 110)]);
+    }
+
+    #[test]
+    fn stop_outcome_round_trips_through_lparam() {
+        let o = StopOutcome { by: StopBy::Close, ms: 31_234 };
+        assert_eq!(decode_outcome(LPARAM(encode_outcome(o))), o);
+    }
+
+    #[test]
+    fn launch_args() {
+        let args: Vec<String> =
+            ["webdev.toml", "--skip", "worker, functions", "--only", "api"].iter().map(|s| s.to_string()).collect();
+        let (path, sel) = parse_launch_args(&args).unwrap();
+        assert_eq!(path, Some(PathBuf::from("webdev.toml")));
+        assert_eq!(sel.skip, ["worker", "functions"]);
+        assert_eq!(sel.only, ["api"]);
+        assert!(parse_launch_args(&["--bogus".to_string()]).is_err());
     }
 }
