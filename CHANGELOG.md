@@ -4,6 +4,16 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+### Added
+
+- Per-app `env` table: extra environment variables for the app.
+- Per-app `exit_with = "main"`: the app counts as exited when its launched process exits, and anything it left running is killed. Fixes undetected exits and slow shutdown for `dotnet run`, whose build servers otherwise keep the app counted as alive.
+- .NET and Java (Solr) sections in `AGENTS.md`.
+
+### Changed
+
+- After Ctrl+C, an app whose only remaining processes are `cmd.exe` and `conhost.exe` moves straight to closing its console. Batch wrappers such as `solr.cmd`, left at `Terminate batch job (Y/N)?`, and plain `cmd` shells no longer wait out the full shutdown timeout.
+
 ## [0.3.0] - 2026-11-24
 
 ### Added

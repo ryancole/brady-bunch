@@ -66,6 +66,8 @@ Per `[[app]]`:
 | `shutdown` | `"auto"`, `"ctrl-c"`, `"close"` or `"kill"` | `"auto"` | How this app is stopped (see Shutdown). |
 | `shutdown_timeout_ms` | integer | top-level value | Per-app override. |
 | `restart` | `"never"`, `"on-failure"` or `"always"` | `"never"` | Relaunch the app after it exits on its own. `on-failure` covers a non-zero exit code or a failed launch. |
+| `env` | table of strings | none | Extra environment variables, e.g. `env = { ASPNETCORE_ENVIRONMENT = "Development" }`. Added to the host's environment, replacing variables with the same name (case-insensitive). Values are used as-is: `%VAR%` isn't expanded. |
+| `exit_with` | `"all"` or `"main"` | `"all"` | What counts as the app exiting. `all`: every process it started has exited. `main`: the launched process has exited (for console apps, the program running inside conhost), and anything it left behind is killed. Use `main` for `dotnet run`/`dotnet watch` and other tools that leave background servers running. |
 | `restart_delay_ms` | integer | `1000` | Wait before an automatic restart. It doubles, up to 30s, each time the app exits within 10s of starting, and resets once it runs longer. |
 
 Config rules:
@@ -75,7 +77,48 @@ Config rules:
 - Quote an exe path containing spaces inside `command`, as shown above.
 - The exe is looked up through the host's PATH and working directory, not the app's `cwd`. Use an absolute exe path if in doubt.
 - Only real `.exe` files launch directly. Run `.cmd`/`.bat` wrappers (`npm`, `npx`, `yarn`, `pnpm`), shell builtins and pipelines through `cmd /c`: `command = 'cmd /c "npm run build && npm start"'`.
-- After Ctrl+C, a batch wrapper may stop at `Terminate batch job (Y/N)?`. That's harmless: the console window is closed when the timeout runs out. Set a shorter `shutdown_timeout_ms` on these apps to speed this up.
+- After Ctrl+C, a batch wrapper may stop at `Terminate batch job (Y/N)?`. That's handled: once only `cmd.exe` and `conhost.exe` are left in the app, brady-bunch closes the console right away instead of waiting out the timeout.
+
+## .NET apps
+
+`dotnet run`, `dotnet build` and `dotnet watch` start build servers (MSBuild worker nodes, the MSBuild server and `VBCSCompiler`) that keep running after the build. They belong to the app's job, so by default brady-bunch counts them as part of the app:
+
+- An app that exits never shows `exited`, so `restart` never fires.
+- Shutdown waits out every step's timeout before killing them, even after the app itself has stopped.
+
+Set `exit_with = "main"` on these apps. The app's exit is then judged by `dotnet` itself, and the build servers are killed with it. Each restart then builds without warm build servers, so it's a few seconds slower.
+
+```toml
+[[app]]
+name = "api"
+command = 'dotnet run --project src\Api'
+cwd = 'C:\src\myapp'
+exit_with = "main"
+restart = "on-failure"
+shutdown_timeout_ms = 30000
+env = { ASPNETCORE_ENVIRONMENT = "Development" }
+```
+
+- **Run the built output instead** where you can (`command = 'src\Api\bin\Debug\net9.0\Api.exe'`): it starts faster and starts no build servers. Build once before launching.
+- **Two apps building the same project at once** with `dotnet run` can fail on locked files. Build first and use `dotnet run --no-build`, or run the built output.
+- **Shutdown timeout:** Generic Host apps (`IHost`, ASP.NET Core) stop gracefully on Ctrl+C, but `HostOptions.ShutdownTimeout` defaults to 30s. Set `shutdown_timeout_ms` to at least the time your app needs to stop, or it gets `CTRL_CLOSE_EVENT` part-way through.
+- **Exit codes** come from `dotnet`, which passes through the app's code.
+
+## Java apps (Solr, etc.)
+
+The JVM treats Ctrl+C as a normal shutdown and runs its shutdown hooks, so Java servers such as Solr and Jetty stop gracefully. Java starts no background helpers, so the default `exit_with` works.
+
+```toml
+[[app]]
+name = "solr"
+command = 'C:\solr\bin\solr.cmd start -f -p 8983'
+shutdown_timeout_ms = 30000
+env = { JAVA_HOME = 'C:\Program Files\Microsoft\jdk-21' }
+```
+
+- **Run in the foreground.** `solr.cmd start` without `-f` starts Java in the background and returns. The tile then shows `exited` while Solr keeps running, and Solr is no longer stopped gracefully on shutdown (it's killed with the job).
+- **Shutdown timeout:** give the server enough time to stop. Solr may take several seconds to close its cores. If Java is still running when the timeout expires, its console is closed, which gives the JVM about 5 more seconds before Windows kills it.
+- **Java location:** launchers such as `solr.cmd` look for `JAVA_HOME` or `java` on PATH. Set `JAVA_HOME` per app with `env` if the machine doesn't have it.
 
 ## Shutdown
 

@@ -1,7 +1,8 @@
 //! Child process lifecycle: launch into a job object, find and embed its window,
 //! and shut it down gracefully.
 
-use crate::config::{AppConfig, Restart, Shutdown};
+use crate::config::{AppConfig, ExitWith, Restart, Shutdown};
+use std::collections::BTreeMap;
 use crate::ctrlc;
 use std::ffi::c_void;
 use std::io::Read;
@@ -20,8 +21,8 @@ use windows::Win32::System::JobObjects::{
     TerminateJobObject,
 };
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, OpenProcess, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, STARTUPINFOW, TerminateProcess,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, OpenProcess, PROCESS_INFORMATION,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResumeThread, STARTUPINFOW, TerminateProcess,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, Result, w};
@@ -64,10 +65,7 @@ pub struct Child {
     /// One job per app: tracks every process it spawns (including launcher hand-offs)
     /// and kills them all if the host dies without a clean shutdown.
     job: Option<Arc<Handle>>,
-    process: Option<Handle>,
-    /// Console apps: the app itself, as opposed to the conhost.exe `process` that hosts it.
-    /// conhost always exits with 0, so the app's exit code is read from here.
-    console_app: Arc<Mutex<Option<Handle>>>,
+    main: Option<Arc<MainProcess>>,
     pub pid: u32,
     pub window: Option<Embedded>,
     pub status: Status,
@@ -99,8 +97,7 @@ impl Child {
             cfg: cfg.clone(),
             console,
             job: None,
-            process: None,
-            console_app: Arc::default(),
+            main: None,
             pid: 0,
             window: None,
             status: Status::WaitingForWindow,
@@ -122,18 +119,17 @@ impl Child {
     fn start(&mut self) {
         // Dropping the old job kills anything left in it (KILL_ON_JOB_CLOSE).
         self.job = None;
-        self.process = None;
+        self.main = None;
         self.pid = 0;
         self.window = None;
         self.restart_at = None;
         self.started_at = Instant::now();
         self.status = Status::WaitingForWindow;
-        self.console_app = Arc::default();
-        match unsafe { launch(&self.cfg.command, self.cfg.cwd.as_deref(), self.console) } {
+        let cfg = &self.cfg;
+        match unsafe { launch(&cfg.command, cfg.cwd.as_deref(), self.console, &cfg.env) } {
             Ok(l) => {
                 self.job = Some(l.job);
-                self.process = Some(l.process);
-                self.console_app = l.console_app;
+                self.main = Some(l.main);
                 self.pid = l.pid;
             }
             Err(e) => {
@@ -214,7 +210,12 @@ impl Child {
         if !self.is_active() {
             return (changed, false);
         }
-        if job_active_count(job.0) == 0 {
+        let main_code = self.main_exit_code();
+        if main_code.is_some() || job_active_count(job.0) == 0 {
+            if let Some(code) = main_code {
+                // Kill whatever the main process left behind (build servers, etc.).
+                let _ = unsafe { TerminateJobObject(job.0, code) };
+            }
             self.status = Status::Exited(self.exit_code());
             self.window = None;
             if !shutting_down {
@@ -237,12 +238,15 @@ impl Child {
     }
 
     fn exit_code(&self) -> u32 {
-        let mut code = 0u32;
-        let app = self.console_app.lock().unwrap();
-        if let Some(p) = app.as_ref().or(self.process.as_ref()) {
-            let _ = unsafe { GetExitCodeProcess(p.0, &mut code) };
+        self.main.as_ref().and_then(|m| m.exit_code()).unwrap_or(1)
+    }
+
+    /// With `exit_with = "main"`: the main process's exit code once it has exited.
+    fn main_exit_code(&self) -> Option<u32> {
+        if self.cfg.exit_with != ExitWith::Main {
+            return None;
         }
-        code
+        self.main.as_ref()?.exit_code()
     }
 
     /// Build the shutdown plan for a background thread, or None if nothing is running.
@@ -259,6 +263,7 @@ impl Child {
             method: self.cfg.shutdown,
             timeout: Duration::from_millis(self.cfg.shutdown_timeout_ms.unwrap_or(default_timeout_ms)),
             helper_exe: helper_exe.to_path_buf(),
+            main: self.main.clone().filter(|_| self.cfg.exit_with == ExitWith::Main),
         })
     }
 
@@ -294,6 +299,8 @@ pub struct StopPlan {
     method: Shutdown,
     timeout: Duration,
     helper_exe: PathBuf,
+    /// Set with `exit_with = "main"`: the stop is done once this process exits.
+    main: Option<Arc<MainProcess>>,
 }
 
 #[derive(Clone, Copy)]
@@ -312,8 +319,8 @@ impl StopPlan {
             (Shutdown::Kill, _) => &[],
         };
         for step in steps {
-            if job_active_count(self.job.0) == 0 {
-                return;
+            if self.done() {
+                break;
             }
             match step {
                 Step::CtrlC => {
@@ -323,12 +330,39 @@ impl StopPlan {
                 }
                 Step::Close => self.post_close(),
             }
-            if wait_for_exit(self.job.0, self.timeout) {
-                return;
+            // After Ctrl+C, a batch wrapper (solr.cmd, npm.cmd...) whose program has exited
+            // sits at "Terminate batch job (Y/N)?", and a plain cmd shell ignores Ctrl+C.
+            // Either way, waiting longer achieves nothing, so move on to the next step.
+            let shells_count_as_stopped = matches!(step, Step::CtrlC);
+            if self.wait(self.timeout, shells_count_as_stopped) {
+                break;
             }
         }
-        let _ = unsafe { TerminateJobObject(self.job.0, 1) };
-        wait_for_exit(self.job.0, Duration::from_secs(2));
+        // Kill anything left: everything after a timeout, or just the leftovers once the
+        // main process has exited.
+        if job_active_count(self.job.0) > 0 {
+            let _ = unsafe { TerminateJobObject(self.job.0, 1) };
+            wait_for_exit(self.job.0, Duration::from_secs(2));
+        }
+    }
+
+    fn done(&self) -> bool {
+        job_active_count(self.job.0) == 0 || self.main.as_ref().is_some_and(|m| m.exit_code().is_some())
+    }
+
+    /// Wait for the stop to finish. Returns true if it did; false on timeout, or early
+    /// if `skip_on_shells` is set and only cmd.exe/conhost.exe are left.
+    fn wait(&self, timeout: Duration, skip_on_shells: bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.done() {
+                return true;
+            }
+            if Instant::now() >= deadline || (skip_on_shells && only_shells_left(self.job.0)) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn post_close(&self) {
@@ -342,14 +376,56 @@ impl StopPlan {
     }
 }
 
-struct Launched {
-    job: Arc<Handle>,
+/// The process an app's exit code (and, with `exit_with = "main"`, its exit) is judged by.
+pub struct MainProcess {
+    /// The launched process: the app itself, or conhost.exe for console apps.
     process: Handle,
-    pid: u32,
-    console_app: Arc<Mutex<Option<Handle>>>,
+    /// Console apps: the app running inside conhost, once the job reports it. conhost
+    /// always exits with 0, so the app's exit code is read from here.
+    console_app: Mutex<Option<Handle>>,
 }
 
-unsafe fn launch(command: &str, cwd: Option<&str>, console: bool) -> Result<Launched> {
+impl MainProcess {
+    /// The exit code, or None while the process is still running.
+    fn exit_code(&self) -> Option<u32> {
+        const STILL_ACTIVE: u32 = 259;
+        let app = self.console_app.lock().unwrap();
+        let p = app.as_ref().unwrap_or(&self.process);
+        let mut code = 0u32;
+        unsafe { GetExitCodeProcess(p.0, &mut code) }.ok()?;
+        (code != STILL_ACTIVE).then_some(code)
+    }
+}
+
+struct Launched {
+    job: Arc<Handle>,
+    main: Arc<MainProcess>,
+    pid: u32,
+}
+
+/// The host's environment with `env` applied, as a CreateProcessW Unicode block.
+fn environment_block(env: &BTreeMap<String, String>) -> Vec<u16> {
+    let mut vars: Vec<(String, String)> = std::env::vars_os()
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+        .filter(|(k, _)| !env.keys().any(|e| e.eq_ignore_ascii_case(k)))
+        .collect();
+    vars.extend(env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    vars.sort_by_key(|(k, _)| k.to_uppercase());
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in vars {
+        block.extend(format!("{k}={v}").encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+unsafe fn launch(
+    command: &str,
+    cwd: Option<&str>,
+    console: bool,
+    env: &BTreeMap<String, String>,
+) -> Result<Launched> {
     unsafe {
         let job = Arc::new(Handle(CreateJobObjectW(None, PCWSTR::null())?));
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
@@ -374,33 +450,37 @@ unsafe fn launch(command: &str, cwd: Option<&str>, console: bool) -> Result<Laun
         let cwd_p = cwd_h.as_ref().map_or(PCWSTR::null(), |h| PCWSTR(h.as_ptr()));
         let si = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, ..Default::default() };
         let mut pi = PROCESS_INFORMATION::default();
+        let env_block = (!env.is_empty()).then(|| environment_block(env));
+        let mut flags = CREATE_SUSPENDED;
+        if env_block.is_some() {
+            flags |= CREATE_UNICODE_ENVIRONMENT;
+        }
         CreateProcessW(
             PCWSTR::null(),
             Some(PWSTR(cmd_w.as_mut_ptr())),
             None,
             None,
             false,
-            CREATE_SUSPENDED,
-            None,
+            flags,
+            env_block.as_ref().map(|b| b.as_ptr() as *const c_void),
             cwd_p,
             &si,
             &mut pi,
         )?;
-        let process = Handle(pi.hProcess);
+        let main = Arc::new(MainProcess { process: Handle(pi.hProcess), console_app: Mutex::new(None) });
         let thread = Handle(pi.hThread);
-        let console_app = Arc::default();
         if console {
             // Must be associated before the process joins the job, so the app's
             // NEW_PROCESS message isn't missed.
-            watch_console_app(&job, pi.dwProcessId, &console_app)?;
+            watch_console_app(&job, pi.dwProcessId, &main)?;
         }
         // Assign before the first instruction runs so every grandchild lands in the job.
-        if let Err(e) = AssignProcessToJobObject(job.0, process.0) {
-            let _ = TerminateProcess(process.0, 1);
+        if let Err(e) = AssignProcessToJobObject(job.0, main.process.0) {
+            let _ = TerminateProcess(main.process.0, 1);
             return Err(e);
         }
         ResumeThread(thread.0);
-        Ok(Launched { job, process, pid: pi.dwProcessId, console_app })
+        Ok(Launched { job, main, pid: pi.dwProcessId })
     }
 }
 
@@ -413,7 +493,7 @@ const JOB_MSG_NEW_PROCESS: u32 = 6;
 unsafe fn watch_console_app(
     job: &Arc<Handle>,
     launcher_pid: u32,
-    slot: &Arc<Mutex<Option<Handle>>>,
+    main: &Arc<MainProcess>,
 ) -> Result<()> {
     unsafe {
         let port = Handle(CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1)?);
@@ -428,7 +508,7 @@ unsafe fn watch_console_app(
             size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
         )?;
         let job: Weak<Handle> = Arc::downgrade(job);
-        let slot = slot.clone();
+        let main = main.clone();
         std::thread::spawn(move || {
             let port = port; // Move the whole Handle (Send), not just its raw HANDLE field.
             loop {
@@ -444,7 +524,7 @@ unsafe fn watch_console_app(
                 match msg {
                     JOB_MSG_NEW_PROCESS => {
                         let pid = ov as usize as u32;
-                        let mut app = slot.lock().unwrap();
+                        let mut app = main.console_app.lock().unwrap();
                         if pid != launcher_pid
                             && app.is_none()
                             && let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
@@ -544,6 +624,27 @@ fn job_pids(job: HANDLE) -> Vec<u32> {
         return Vec::new();
     }
     list.ids[..(list.listed as usize).min(256)].iter().map(|&p| p as u32).collect()
+}
+
+/// True if every process still in the job is cmd.exe or conhost.exe.
+fn only_shells_left(job: HANDLE) -> bool {
+    let pids = job_pids(job);
+    !pids.is_empty()
+        && pids.iter().all(|&pid| {
+            process_name(pid).is_some_and(|n| n.eq_ignore_ascii_case("cmd.exe") || n.eq_ignore_ascii_case("conhost.exe"))
+        })
+}
+
+/// The file name of a process's executable, e.g. `cmd.exe`.
+fn process_name(pid: u32) -> Option<String> {
+    unsafe {
+        let h = Handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?);
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).ok()?;
+        let path = PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
+        Some(path.file_name()?.to_string_lossy().into_owned())
+    }
 }
 
 fn wait_for_exit(job: HANDLE, timeout: Duration) -> bool {

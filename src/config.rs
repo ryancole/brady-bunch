@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_FILE: &str = "brady.toml";
@@ -28,6 +29,18 @@ pub enum Restart {
     OnFailure,
     /// Relaunch after any exit.
     Always,
+}
+
+/// What counts as the app having exited.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExitWith {
+    /// Every process the app started has exited.
+    #[default]
+    All,
+    /// The launched process has exited (for console apps, the app inside conhost).
+    /// Anything it left running, such as build servers, is killed.
+    Main,
 }
 
 #[derive(Deserialize, Debug)]
@@ -63,6 +76,11 @@ pub struct AppConfig {
     pub restart: Restart,
     /// Wait before relaunching; doubles (up to 30s) while the app keeps exiting quickly.
     pub restart_delay_ms: Option<u64>,
+    /// Extra environment variables, added to (or overriding) the host's environment.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub exit_with: ExitWith,
 }
 
 fn default_title() -> String {

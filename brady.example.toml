@@ -23,5 +23,7 @@ command = "charmap.exe"
 # shutdown = "auto"          # auto | ctrl-c | close | kill
 # console = false            # override console/GUI detection
 # shutdown_timeout_ms = 2000
+# exit_with = "all"          # all | main; use main for `dotnet run` and other tools that leave servers running
+# env = { DOTNET_ENVIRONMENT = "Development" }
 # restart = "never"          # never | on-failure | always
 # restart_delay_ms = 1000    # doubles up to 30s while the app keeps exiting quickly
