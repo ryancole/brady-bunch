@@ -4,6 +4,8 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
 ### Added
 
 - Per-app `env` table: extra environment variables for the app.
