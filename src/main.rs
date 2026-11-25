@@ -293,26 +293,12 @@ impl Ui {
             .map(|c| c as usize)
             .unwrap_or_else(|| (n as f64).sqrt().ceil() as usize)
             .clamp(1, n);
-        let rows = n.div_ceil(cols);
-        let gap = self.scale(4);
-        let (w, h) = (client.right - gap, client.bottom - gap);
+        let (margin, gap) = (self.scale(MARGIN), self.scale(GAP));
         if let Some(z) = self.zoomed {
-            let full = RECT { left: gap, top: gap, right: w, bottom: h };
+            let full = grid(client, 1, 1, margin, gap)[0];
             return (0..n).map(|i| if i == z { full } else { RECT::default() }).collect();
         }
-        (0..n)
-            .map(|i| {
-                let (row, col) = (i / cols, i % cols);
-                let in_row = cols.min(n - row * cols) as i32;
-                let (row, col, rows) = (row as i32, col as i32, rows as i32);
-                RECT {
-                    left: gap + w * col / in_row,
-                    top: gap + h * row / rows,
-                    right: w * (col + 1) / in_row,
-                    bottom: h * (row + 1) / rows,
-                }
-            })
-            .collect()
+        grid(client, n, cols, margin, gap)
     }
 
     /// True if another tile is zoomed, so this one isn't shown.
@@ -572,6 +558,38 @@ impl Ui {
     }
 }
 
+/// Space between the window edge and the tiles, in 96-DPI pixels.
+const MARGIN: i32 = 10;
+/// Space between neighbouring tiles, in 96-DPI pixels.
+const GAP: i32 = 8;
+
+/// Lay out `n` tiles in `cols` columns inside `client`, with `margin` around the grid
+/// and `gap` between tiles. A short last row stretches to fill the width.
+fn grid(client: RECT, n: usize, cols: usize, margin: i32, gap: i32) -> Vec<RECT> {
+    let rows = n.div_ceil(cols) as i32;
+    let width = (client.right - client.left - 2 * margin).max(0);
+    let height = (client.bottom - client.top - 2 * margin).max(0);
+    // Start and end of slot `i` of `count` along a span, gaps excluded.
+    let span = |len: i32, i: i32, count: i32| {
+        let usable = (len - gap * (count - 1)).max(0);
+        (usable * i / count + gap * i, usable * (i + 1) / count + gap * i)
+    };
+    (0..n)
+        .map(|i| {
+            let (row, col) = ((i / cols) as i32, (i % cols) as i32);
+            let in_row = cols.min(n - row as usize * cols) as i32;
+            let (left, right) = span(width, col, in_row);
+            let (top, bottom) = span(height, row, rows);
+            RECT {
+                left: client.left + margin + left,
+                top: client.top + margin + top,
+                right: client.left + margin + right,
+                bottom: client.top + margin + bottom,
+            }
+        })
+        .collect()
+}
+
 fn contains(r: &RECT, pt: POINT) -> bool {
     pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
 }
@@ -607,5 +625,35 @@ fn message_font(dpi: u32) -> HFONT {
             dpi,
         );
         CreateFontIndirectW(&m.lfMessageFont)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT { left, top, right, bottom }
+    }
+
+    #[test]
+    fn grid_has_margins_and_gaps() {
+        // 2x2 in a 220x120 client: 10 margin, 8 gap -> 200x100 usable, cells 96x46.
+        let cells = grid(rect(0, 0, 220, 120), 4, 2, 10, 8);
+        assert_eq!(
+            cells,
+            [rect(10, 10, 106, 56), rect(114, 10, 210, 56), rect(10, 64, 106, 110), rect(114, 64, 210, 110)]
+        );
+    }
+
+    #[test]
+    fn short_last_row_stretches() {
+        let cells = grid(rect(0, 0, 220, 120), 3, 2, 10, 8);
+        assert_eq!(cells[2], rect(10, 64, 210, 110));
+    }
+
+    #[test]
+    fn single_tile_fills_inside_margin() {
+        assert_eq!(grid(rect(0, 0, 220, 120), 1, 1, 10, 8), [rect(10, 10, 210, 110)]);
     }
 }

@@ -17,6 +17,7 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ### Changed
 
+- Tiles have a 10px margin from the window edges and an 8px gap between them (scaled for DPI), instead of 4px.
 - A relative `cwd` is relative to the config file's folder, not the host's working directory.
 - After Ctrl+C, an app whose only remaining processes are `cmd.exe` and `conhost.exe` moves straight to closing its console. Batch wrappers such as `solr.cmd`, left at `Terminate batch job (Y/N)?`, and plain `cmd` shells no longer wait out the full shutdown timeout.
 
