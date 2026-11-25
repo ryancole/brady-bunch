@@ -45,6 +45,8 @@ struct Ui {
     children: Vec<Child>,
     shutting_down: bool,
     pending_stops: usize,
+    /// Tile shown alone, filling the window; toggled by double-clicking a tile header.
+    zoomed: Option<usize>,
     dpi: u32,
     font: HFONT,
 }
@@ -89,7 +91,7 @@ unsafe fn run(cfg: config::Config) -> Result<()> {
         let instance = GetModuleHandleW(None)?;
         let class = w!("BradyBunchHost");
         let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
@@ -126,6 +128,7 @@ unsafe fn run(cfg: config::Config) -> Result<()> {
                 children,
                 shutting_down: false,
                 pending_stops: 0,
+                zoomed: None,
                 dpi,
                 font: message_font(dpi),
             })
@@ -160,6 +163,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(()) => LRESULT(0),
                 None => DefWindowProcW(hwnd, msg, wp, lp),
             },
+            WM_LBUTTONDBLCLK => {
+                let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
+                with_ui(|ui| ui.toggle_zoom_at(POINT { x, y }));
+                LRESULT(0)
+            }
             WM_LBUTTONUP => {
                 let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
                 with_ui(|ui| ui.click(POINT { x, y }));
@@ -257,6 +265,10 @@ impl Ui {
         let rows = n.div_ceil(cols);
         let gap = self.scale(4);
         let (w, h) = (client.right - gap, client.bottom - gap);
+        if let Some(z) = self.zoomed {
+            let full = RECT { left: gap, top: gap, right: w, bottom: h };
+            return (0..n).map(|i| if i == z { full } else { RECT::default() }).collect();
+        }
         (0..n)
             .map(|i| {
                 let (row, col) = (i / cols, i % cols);
@@ -272,6 +284,23 @@ impl Ui {
             .collect()
     }
 
+    /// True if another tile is zoomed, so this one isn't shown.
+    fn is_hidden(&self, index: usize) -> bool {
+        self.zoomed.is_some_and(|z| z != index)
+    }
+
+    fn toggle_zoom_at(&mut self, pt: POINT) {
+        let cells = self.cells();
+        let hit = cells.iter().enumerate().position(|(i, cell)| {
+            let (h, _) = self.split(cell);
+            !self.is_hidden(i) && contains(&h, pt)
+        });
+        if let Some(i) = hit {
+            self.zoomed = if self.zoomed == Some(i) { None } else { Some(i) };
+            self.layout();
+        }
+    }
+
     fn split(&self, cell: &RECT) -> (RECT, RECT) {
         let header_h = self.scale(24);
         let header = RECT { bottom: cell.top + header_h, ..*cell };
@@ -281,9 +310,15 @@ impl Ui {
 
     fn layout(&mut self) {
         let cells = self.cells();
-        for (c, cell) in self.children.iter().zip(&cells) {
+        for (i, (c, cell)) in self.children.iter().zip(&cells).enumerate() {
             if let Some(w) = &c.window {
                 let (_, b) = self.split(cell);
+                // Hidden tiles keep their size, so consoles don't reflow to a zero width.
+                let visibility = if self.is_hidden(i) {
+                    SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE
+                } else {
+                    SWP_SHOWWINDOW
+                };
                 unsafe {
                     // Async so a hung child can't freeze the host.
                     let _ = SetWindowPos(
@@ -293,7 +328,7 @@ impl Ui {
                         b.top,
                         b.right - b.left,
                         b.bottom - b.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | visibility,
                     );
                 }
             }
@@ -317,7 +352,10 @@ impl Ui {
             SetBkMode(hdc, TRANSPARENT);
             let pad = self.scale(8);
 
-            for (c, cell) in self.children.iter().zip(self.cells()) {
+            for (i, (c, cell)) in self.children.iter().zip(self.cells()).enumerate() {
+                if self.is_hidden(i) {
+                    continue;
+                }
                 let (h, b) = self.split(&cell);
                 FillRect(hdc, &h, header);
                 let text_rc = RECT { left: h.left + pad, right: h.right - pad, ..h };
@@ -325,6 +363,9 @@ impl Ui {
                 draw_text(hdc, &status, text_rc, color, DT_RIGHT);
                 let name_rc = RECT { right: text_rc.right - self.scale(140), ..text_rc };
                 draw_text(hdc, &c.name, name_rc, TEXT, DT_LEFT);
+                if self.zoomed.is_some() {
+                    draw_text(hdc, "double-click to restore the grid", text_rc, DIM, DT_CENTER);
+                }
                 if c.window.is_none() {
                     FillRect(hdc, &b, panel);
                     let hint = if self.shutting_down {
@@ -361,9 +402,11 @@ impl Ui {
         if self.shutting_down {
             return None;
         }
-        self.cells().iter().position(|r| {
-            pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
-        }).filter(|&i| self.children[i].can_restart())
+        // Only the body: the header is for double-click zoom.
+        self.cells()
+            .iter()
+            .position(|cell| contains(&self.split(cell).1, pt))
+            .filter(|&i| !self.is_hidden(i) && self.children[i].can_restart())
     }
 
     fn click(&mut self, pt: POINT) {
@@ -451,6 +494,10 @@ impl Ui {
         }
         self.font = message_font(dpi);
     }
+}
+
+fn contains(r: &RECT, pt: POINT) -> bool {
+    pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
 }
 
 fn status_text(c: &Child) -> (String, COLORREF) {

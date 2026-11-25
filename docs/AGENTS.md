@@ -104,11 +104,13 @@ For each app, steps escalate. Each step waits up to the app's timeout for every 
 - **Console apps run under `conhost.exe`.** brady-bunch starts `conhost.exe <command>`, so a console app's parent process is `conhost.exe`, which is a child of `brady-bunch.exe`. Their output appears only in the tile; it can't be captured from brady-bunch. To keep logs, redirect inside the command: `command = 'cmd /c "server.exe > C:\logs\server.log 2>&1"'`.
 - **Errors appear as a message box.** A missing or invalid config file shows a modal error dialog, and the exe exits with code 1 only after someone clicks OK. Validate the config before launching it unattended, and treat a host that doesn't show its window promptly as possibly stuck on that dialog.
 - **Launch failures don't stop the host.** If an app's command can't start, its tile shows `failed: <reason>` and the other apps keep running.
-- **Apps that exit on their own** leave a tile showing `exited (<code>)`. They're relaunched only if `restart` says so; otherwise clicking the tile restarts them. Apps are never restarted during shutdown.
+- **Apps that exit on their own** leave a tile showing `exited (<code>)`. They're relaunched only if `restart` says so; otherwise clicking the tile's body restarts them. Apps are never restarted during shutdown.
 - **Exit codes of console apps** are the app's own, not `conhost.exe`'s.
 - **Windows that can't be embedded.** Store/UWP apps (the new Notepad, Calculator, Windows Terminal) and elevated apps (when the host isn't elevated) still run and are still shut down, but their windows stay outside the host.
 
 ## Tile states
+
+Double-clicking a tile's header zooms that tile to fill the window, hiding the others (their apps keep running). Double-clicking again restores the grid.
 
 Each tile's header shows the app name and one of these states:
 

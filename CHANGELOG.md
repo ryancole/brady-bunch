@@ -7,7 +7,8 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 ### Added
 
 - `restart = "on-failure" | "always"` relaunches an app after it exits on its own, waiting `restart_delay_ms` (default 1000) first. The delay doubles, up to 30s, while the app keeps exiting within 10s of starting.
-- Clicking an exited or failed tile restarts that app.
+- Clicking the body of an exited or failed tile restarts that app.
+- Double-clicking a tile's header zooms it to fill the window; double-click again to return to the grid.
 
 ### Fixed
 
