@@ -65,6 +65,8 @@ Per `[[app]]`:
 | `console` | bool | auto-detected | Treat as a console app (`true`) or GUI app (`false`). Auto-detection reads the exe's PE header; `.bat`/`.cmd` count as console. |
 | `shutdown` | `"auto"`, `"ctrl-c"`, `"close"` or `"kill"` | `"auto"` | How this app is stopped (see Shutdown). |
 | `shutdown_timeout_ms` | integer | top-level value | Per-app override. |
+| `restart` | `"never"`, `"on-failure"` or `"always"` | `"never"` | Relaunch the app after it exits on its own. `on-failure` covers a non-zero exit code or a failed launch. |
+| `restart_delay_ms` | integer | `1000` | Wait before an automatic restart. It doubles, up to 30s, each time the app exits within 10s of starting, and resets once it runs longer. |
 
 Config rules:
 
@@ -102,7 +104,8 @@ For each app, steps escalate. Each step waits up to the app's timeout for every 
 - **Console apps run under `conhost.exe`.** brady-bunch starts `conhost.exe <command>`, so a console app's parent process is `conhost.exe`, which is a child of `brady-bunch.exe`. Their output appears only in the tile; it can't be captured from brady-bunch. To keep logs, redirect inside the command: `command = 'cmd /c "server.exe > C:\logs\server.log 2>&1"'`.
 - **Errors appear as a message box.** A missing or invalid config file shows a modal error dialog, and the exe exits with code 1 only after someone clicks OK. Validate the config before launching it unattended, and treat a host that doesn't show its window promptly as possibly stuck on that dialog.
 - **Launch failures don't stop the host.** If an app's command can't start, its tile shows `failed: <reason>` and the other apps keep running.
-- **Apps that exit on their own** leave a tile showing `exited (<code>)`. They aren't restarted.
+- **Apps that exit on their own** leave a tile showing `exited (<code>)`. They're relaunched only if `restart` says so; otherwise clicking the tile restarts them. Apps are never restarted during shutdown.
+- **Exit codes of console apps** are the app's own, not `conhost.exe`'s.
 - **Windows that can't be embedded.** Store/UWP apps (the new Notepad, Calculator, Windows Terminal) and elevated apps (when the host isn't elevated) still run and are still shut down, but their windows stay outside the host.
 
 ## Tile states
@@ -113,8 +116,8 @@ Each tile's header shows the app name and one of these states:
 |---|---|
 | `starting…` | Running, no window found yet. |
 | `pid N` | Running and embedded. |
-| `exited (N)` | Exited on its own with code N. |
-| `failed: …` | Could not be launched. |
+| `exited (N)` | Exited on its own with code N. The tile body says `Restarting in Ns…` if a restart is scheduled; otherwise `Click to restart`. |
+| `failed: …` | Could not be launched. Restarts like an exited app. |
 | `waiting to stop…` | Shutdown in progress; waiting for apps after it to stop. |
 | `stopping…` | Currently being stopped. |
 | `stopped` | Stopped during shutdown. |

@@ -160,6 +160,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(()) => LRESULT(0),
                 None => DefWindowProcW(hwnd, msg, wp, lp),
             },
+            WM_LBUTTONUP => {
+                let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
+                with_ui(|ui| ui.click(POINT { x, y }));
+                LRESULT(0)
+            }
+            WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                if with_ui(|ui| ui.restartable_at(pt).is_some()).unwrap_or(false)
+                    && let Ok(hand) = LoadCursorW(None, IDC_HAND)
+                {
+                    SetCursor(Some(hand));
+                    return LRESULT(1);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_ERASEBKGND => LRESULT(1), // WM_PAINT covers the whole client area.
             WM_CLOSE => {
                 if with_ui(Ui::request_close).unwrap_or(true) {
@@ -310,7 +327,24 @@ impl Ui {
                 draw_text(hdc, &c.name, name_rc, TEXT, DT_LEFT);
                 if c.window.is_none() {
                     FillRect(hdc, &b, panel);
-                    draw_text(hdc, &c.cfg.command, b, DIM, DT_CENTER);
+                    let hint = if self.shutting_down {
+                        None
+                    } else if let Some(secs) = c.restart_in_secs() {
+                        Some((format!("Restarting in {secs}s… (click to restart now)"), WARN))
+                    } else if c.can_restart() {
+                        Some(("Click to restart".to_string(), TEXT))
+                    } else {
+                        None
+                    };
+                    match hint {
+                        Some((hint, color)) => {
+                            let mid = (b.top + b.bottom) / 2;
+                            let line = self.scale(12);
+                            draw_text(hdc, &c.cfg.command, RECT { top: mid - 2 * line, bottom: mid, ..b }, DIM, DT_CENTER);
+                            draw_text(hdc, &hint, RECT { top: mid, bottom: mid + 2 * line, ..b }, color, DT_CENTER);
+                        }
+                        None => draw_text(hdc, &c.cfg.command, b, DIM, DT_CENTER),
+                    }
                 }
             }
 
@@ -319,6 +353,25 @@ impl Ui {
                 let _ = DeleteObject(brush.into());
             }
             let _ = EndPaint(self.hwnd, &ps);
+        }
+    }
+
+    /// Index of the tile under `pt` if clicking it would restart its app.
+    fn restartable_at(&self, pt: POINT) -> Option<usize> {
+        if self.shutting_down {
+            return None;
+        }
+        self.cells().iter().position(|r| {
+            pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
+        }).filter(|&i| self.children[i].can_restart())
+    }
+
+    fn click(&mut self, pt: POINT) {
+        if let Some(i) = self.restartable_at(pt) {
+            self.children[i].restart();
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
         }
     }
 

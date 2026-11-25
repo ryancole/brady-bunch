@@ -23,3 +23,5 @@ command = "charmap.exe"
 # shutdown = "auto"          # auto | ctrl-c | close | kill
 # console = false            # override console/GUI detection
 # shutdown_timeout_ms = 2000
+# restart = "never"          # never | on-failure | always
+# restart_delay_ms = 1000    # doubles up to 30s while the app keeps exiting quickly

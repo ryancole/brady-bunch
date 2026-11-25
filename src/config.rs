@@ -18,6 +18,18 @@ pub enum Shutdown {
     Kill,
 }
 
+/// Whether a child is relaunched after it exits on its own.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Restart {
+    #[default]
+    Never,
+    /// Relaunch after a non-zero exit code or a failed launch.
+    OnFailure,
+    /// Relaunch after any exit.
+    Always,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -47,6 +59,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub shutdown: Shutdown,
     pub shutdown_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub restart: Restart,
+    /// Wait before relaunching; doubles (up to 30s) while the app keeps exiting quickly.
+    pub restart_delay_ms: Option<u64>,
 }
 
 fn default_title() -> String {

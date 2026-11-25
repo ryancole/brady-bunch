@@ -1,25 +1,27 @@
 //! Child process lifecycle: launch into a job object, find and embed its window,
 //! and shut it down gracefully.
 
-use crate::config::{AppConfig, Shutdown};
+use crate::config::{AppConfig, Restart, Shutdown};
 use crate::ctrlc;
 use std::ffi::c_void;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WPARAM};
+use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 use windows::Win32::Storage::FileSystem::SearchPathW;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JobObjectAssociateCompletionPortInformation,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     TerminateJobObject,
 };
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION, ResumeThread,
-    STARTUPINFOW, TerminateProcess,
+    CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, OpenProcess, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, STARTUPINFOW, TerminateProcess,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, Result, w};
@@ -63,10 +65,24 @@ pub struct Child {
     /// and kills them all if the host dies without a clean shutdown.
     job: Option<Arc<Handle>>,
     process: Option<Handle>,
+    /// Console apps: the app itself, as opposed to the conhost.exe `process` that hosts it.
+    /// conhost always exits with 0, so the app's exit code is read from here.
+    console_app: Arc<Mutex<Option<Handle>>>,
     pub pid: u32,
     pub window: Option<Embedded>,
     pub status: Status,
+    started_at: Instant,
+    /// When an automatic restart is due, if one is scheduled.
+    pub restart_at: Option<Instant>,
+    /// Delay before the next automatic restart; grows while the app keeps exiting quickly.
+    backoff: Duration,
+    shown_secs: Option<u64>,
 }
+
+const DEFAULT_RESTART_DELAY: Duration = Duration::from_millis(1000);
+const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
+/// An app that ran at least this long before exiting resets the restart backoff.
+const STABLE_RUN: Duration = Duration::from_secs(10);
 
 impl Child {
     pub fn spawn(cfg: &AppConfig) -> Child {
@@ -84,19 +100,82 @@ impl Child {
             console,
             job: None,
             process: None,
+            console_app: Arc::default(),
             pid: 0,
             window: None,
             status: Status::WaitingForWindow,
+            started_at: Instant::now(),
+            restart_at: None,
+            backoff: Duration::ZERO,
+            shown_secs: None,
         };
-        match unsafe { launch(&cfg.command, cfg.cwd.as_deref(), console) } {
-            Ok((job, process, pid)) => {
-                child.job = Some(Arc::new(job));
-                child.process = Some(process);
-                child.pid = pid;
-            }
-            Err(e) => child.status = Status::Failed(e.message()),
-        }
+        child.backoff = child.base_delay();
+        child.start();
         child
+    }
+
+    fn base_delay(&self) -> Duration {
+        self.cfg.restart_delay_ms.map_or(DEFAULT_RESTART_DELAY, Duration::from_millis)
+    }
+
+    /// Launch (or relaunch) the app into a fresh job.
+    fn start(&mut self) {
+        // Dropping the old job kills anything left in it (KILL_ON_JOB_CLOSE).
+        self.job = None;
+        self.process = None;
+        self.pid = 0;
+        self.window = None;
+        self.restart_at = None;
+        self.started_at = Instant::now();
+        self.status = Status::WaitingForWindow;
+        self.console_app = Arc::default();
+        match unsafe { launch(&self.cfg.command, self.cfg.cwd.as_deref(), self.console) } {
+            Ok(l) => {
+                self.job = Some(l.job);
+                self.process = Some(l.process);
+                self.console_app = l.console_app;
+                self.pid = l.pid;
+            }
+            Err(e) => {
+                self.status = Status::Failed(e.message());
+                self.schedule_restart();
+            }
+        }
+    }
+
+    /// Restart now at the user's request, resetting the backoff.
+    pub fn restart(&mut self) {
+        self.backoff = self.base_delay();
+        self.start();
+    }
+
+    /// True if the tile is showing an app that is no longer running.
+    pub fn can_restart(&self) -> bool {
+        matches!(self.status, Status::Exited(_) | Status::Failed(_))
+    }
+
+    /// Schedule an automatic restart if the app's restart policy calls for one.
+    fn schedule_restart(&mut self) {
+        let wanted = match (self.cfg.restart, &self.status) {
+            (Restart::Always, Status::Exited(_) | Status::Failed(_)) => true,
+            (Restart::OnFailure, Status::Exited(code)) => *code != 0,
+            (Restart::OnFailure, Status::Failed(_)) => true,
+            _ => false,
+        };
+        if !wanted {
+            return;
+        }
+        if self.started_at.elapsed() >= STABLE_RUN {
+            self.backoff = self.base_delay();
+        }
+        self.restart_at = Some(Instant::now() + self.backoff);
+        self.backoff = (self.backoff * 2).min(MAX_RESTART_DELAY.max(self.base_delay()));
+    }
+
+    /// Whole seconds until the scheduled restart, rounded up.
+    pub fn restart_in_secs(&self) -> Option<u64> {
+        self.restart_at
+            .map(|t| t.saturating_duration_since(Instant::now()).as_millis().div_ceil(1000) as u64)
     }
 
     pub fn is_active(&self) -> bool {
@@ -105,6 +184,21 @@ impl Child {
 
     /// Track exit and window changes. Returns (repaint needed, relayout needed).
     pub fn poll(&mut self, host: HWND, shutting_down: bool) -> (bool, bool) {
+        if let Some(at) = self.restart_at {
+            if shutting_down {
+                self.restart_at = None;
+                return (true, false);
+            }
+            if Instant::now() >= at {
+                self.start();
+                return (true, false);
+            }
+            // Repaint only when the countdown's displayed second changes.
+            let secs = self.restart_in_secs();
+            let changed = secs != self.shown_secs;
+            self.shown_secs = secs;
+            return (changed, false);
+        }
         let Some(job) = self.job.clone() else {
             return (false, false);
         };
@@ -123,6 +217,9 @@ impl Child {
         if job_active_count(job.0) == 0 {
             self.status = Status::Exited(self.exit_code());
             self.window = None;
+            if !shutting_down {
+                self.schedule_restart();
+            }
             return (true, false);
         }
         if self.window.is_none() && !shutting_down {
@@ -141,7 +238,8 @@ impl Child {
 
     fn exit_code(&self) -> u32 {
         let mut code = 0u32;
-        if let Some(p) = &self.process {
+        let app = self.console_app.lock().unwrap();
+        if let Some(p) = app.as_ref().or(self.process.as_ref()) {
             let _ = unsafe { GetExitCodeProcess(p.0, &mut code) };
         }
         code
@@ -244,9 +342,16 @@ impl StopPlan {
     }
 }
 
-unsafe fn launch(command: &str, cwd: Option<&str>, console: bool) -> Result<(Handle, Handle, u32)> {
+struct Launched {
+    job: Arc<Handle>,
+    process: Handle,
+    pid: u32,
+    console_app: Arc<Mutex<Option<Handle>>>,
+}
+
+unsafe fn launch(command: &str, cwd: Option<&str>, console: bool) -> Result<Launched> {
     unsafe {
-        let job = Handle(CreateJobObjectW(None, PCWSTR::null())?);
+        let job = Arc::new(Handle(CreateJobObjectW(None, PCWSTR::null())?));
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         SetInformationJobObject(
@@ -283,13 +388,76 @@ unsafe fn launch(command: &str, cwd: Option<&str>, console: bool) -> Result<(Han
         )?;
         let process = Handle(pi.hProcess);
         let thread = Handle(pi.hThread);
+        let console_app = Arc::default();
+        if console {
+            // Must be associated before the process joins the job, so the app's
+            // NEW_PROCESS message isn't missed.
+            watch_console_app(&job, pi.dwProcessId, &console_app)?;
+        }
         // Assign before the first instruction runs so every grandchild lands in the job.
         if let Err(e) = AssignProcessToJobObject(job.0, process.0) {
             let _ = TerminateProcess(process.0, 1);
             return Err(e);
         }
         ResumeThread(thread.0);
-        Ok((job, process, pi.dwProcessId))
+        Ok(Launched { job, process, pid: pi.dwProcessId, console_app })
+    }
+}
+
+const JOB_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
+const JOB_MSG_NEW_PROCESS: u32 = 6;
+
+/// Watch the job's completion port and open a handle to the first process that joins
+/// after the conhost launcher, which is the console app itself. Opening it as soon as
+/// it's announced keeps its exit code readable even if it exits before the next poll.
+unsafe fn watch_console_app(
+    job: &Arc<Handle>,
+    launcher_pid: u32,
+    slot: &Arc<Mutex<Option<Handle>>>,
+) -> Result<()> {
+    unsafe {
+        let port = Handle(CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1)?);
+        let assoc = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: std::ptr::null_mut(),
+            CompletionPort: port.0,
+        };
+        SetInformationJobObject(
+            job.0,
+            JobObjectAssociateCompletionPortInformation,
+            &assoc as *const _ as *const c_void,
+            size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
+        )?;
+        let job: Weak<Handle> = Arc::downgrade(job);
+        let slot = slot.clone();
+        std::thread::spawn(move || {
+            let port = port; // Move the whole Handle (Send), not just its raw HANDLE field.
+            loop {
+                let (mut msg, mut key) = (0u32, 0usize);
+                let mut ov: *mut OVERLAPPED = std::ptr::null_mut();
+                if GetQueuedCompletionStatus(port.0, &mut msg, &mut key, &mut ov, 500).is_err() {
+                    // Timed out: stop once the child has dropped (or replaced) the job.
+                    if job.strong_count() == 0 {
+                        return;
+                    }
+                    continue;
+                }
+                match msg {
+                    JOB_MSG_NEW_PROCESS => {
+                        let pid = ov as usize as u32;
+                        let mut app = slot.lock().unwrap();
+                        if pid != launcher_pid
+                            && app.is_none()
+                            && let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                        {
+                            *app = Some(Handle(h));
+                        }
+                    }
+                    JOB_MSG_ACTIVE_PROCESS_ZERO => return,
+                    _ => {}
+                }
+            }
+        });
+        Ok(())
     }
 }
 

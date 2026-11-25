@@ -24,6 +24,7 @@ git push origin v0.1.0
 - **Launch:** each app runs in its own job object set to kill on close. If the host crashes or is force-killed, Windows kills every child and grandchild.
 - **Console apps:** detected from the exe's PE header, or set with `console = true`. They run under an explicit `conhost.exe` so they get an embeddable console window even when Windows Terminal is the default terminal.
 - **Tiling:** the first visible top-level window of any process in the app's job is reparented into a grid cell. If that window closes, for example a splash screen, the next one is picked up.
+- **Restart:** an app that exits on its own is relaunched when `restart = "on-failure"` (non-zero exit or failed launch) or `"always"` is set. The delay (`restart_delay_ms`, default 1000) doubles up to 30s while the app keeps exiting within 10s. Click an exited or failed tile to restart it now.
 - **Shutdown** (closing the window, or `taskkill` without `/f`): apps are stopped one at a time in reverse config order, so the first apps listed stay up until everything after them has exited. For each app:
   - Console apps get Ctrl+C. If they're still running, their console window is closed (`CTRL_CLOSE_EVENT`).
   - GUI apps get `WM_CLOSE`.

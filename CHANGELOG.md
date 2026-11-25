@@ -4,6 +4,15 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+### Added
+
+- `restart = "on-failure" | "always"` relaunches an app after it exits on its own, waiting `restart_delay_ms` (default 1000) first. The delay doubles, up to 30s, while the app keeps exiting within 10s of starting.
+- Clicking an exited or failed tile restarts that app.
+
+### Fixed
+
+- Console apps show their own exit code instead of `conhost.exe`'s, which was always 0.
+
 ## [0.2.1] - 2026-11-17
 
 ### Added
