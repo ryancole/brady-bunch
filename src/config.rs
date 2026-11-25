@@ -109,10 +109,62 @@ pub fn resolve_path(arg: Option<PathBuf>) -> PathBuf {
 pub fn load(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("Could not read config {}: {e}", path.display()))?;
-    let cfg: Config =
+    let mut cfg: Config =
         toml::from_str(&text).map_err(|e| format!("Invalid config {}:\n\n{e}", path.display()))?;
     if cfg.apps.is_empty() {
         return Err(format!("{} has no [[app]] entries.", path.display()));
     }
+    if let Some(dir) = std::path::absolute(path).ok().as_deref().and_then(Path::parent) {
+        resolve_cwds(&mut cfg, dir);
+    }
     Ok(cfg)
+}
+
+/// Make relative `cwd`s relative to the config file's folder rather than the host's
+/// working directory, so a config checked into a repo works wherever it's launched from.
+fn resolve_cwds(cfg: &mut Config, config_dir: &Path) {
+    for app in &mut cfg.apps {
+        if let Some(cwd) = &app.cwd
+            && Path::new(cwd).is_relative()
+        {
+            app.cwd = Some(config_dir.join(cwd).to_string_lossy().into_owned());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cwds(toml_text: &str, dir: &str) -> Vec<Option<String>> {
+        let mut cfg: Config = toml::from_str(toml_text).unwrap();
+        resolve_cwds(&mut cfg, Path::new(dir));
+        cfg.apps.into_iter().map(|a| a.cwd).collect()
+    }
+
+    #[test]
+    fn relative_cwd_resolves_against_config_dir() {
+        let text = r#"
+            [[app]]
+            command = "a"
+            cwd = 'src\Api'
+            [[app]]
+            command = "b"
+            cwd = '..\other'
+            [[app]]
+            command = "c"
+            cwd = 'D:\abs'
+            [[app]]
+            command = "d"
+        "#;
+        assert_eq!(
+            cwds(text, r"C:\repo"),
+            [
+                Some(r"C:\repo\src\Api".to_string()),
+                Some(r"C:\repo\..\other".to_string()),
+                Some(r"D:\abs".to_string()),
+                None,
+            ]
+        );
+    }
 }

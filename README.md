@@ -6,7 +6,7 @@ Launches a list of programs as child processes and tiles their windows inside on
 brady-bunch.exe [config.toml]
 ```
 
-The config defaults to `brady.toml` in the working directory, or next to the exe if there isn't one there. See [brady.example.toml](brady.example.toml).
+The config defaults to `brady.toml` in the working directory, or next to the exe if there isn't one there. Relative `cwd` paths in it are relative to the config file's folder. See [brady.example.toml](brady.example.toml).
 
 ## Install
 
@@ -24,6 +24,7 @@ git push origin v0.1.0
 - **Launch:** each app runs in its own job object set to kill on close. If the host crashes or is force-killed, Windows kills every child and grandchild.
 - **Console apps:** detected from the exe's PE header, or set with `console = true`. They run under an explicit `conhost.exe` so they get an embeddable console window even when Windows Terminal is the default terminal.
 - **Tiling:** the first visible top-level window of any process in the app's job is reparented into a grid cell. If that window closes, for example a splash screen, the next one is picked up.
+- **Keyboard:** click inside a tile to type into it; the focused tile's header turns blue.
 - **Zoom:** double-click a tile's header to show that tile alone, filling the window. Double-click it again to return to the grid.
 - **.NET:** set `exit_with = "main"` on `dotnet run`/`dotnet watch` apps. Otherwise the build servers they leave running keep the app counted as alive, so exits aren't detected and shutdown waits out every timeout. See the .NET section of [docs/AGENTS.md](docs/AGENTS.md).
 - **Restart:** an app that exits on its own is relaunched when `restart = "on-failure"` (non-zero exit or failed launch) or `"always"` is set. The delay (`restart_delay_ms`, default 1000) doubles up to 30s while the app keeps exiting within 10s. Click the body of an exited or failed tile to restart it now.

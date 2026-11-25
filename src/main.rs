@@ -14,6 +14,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
     SystemParametersInfoForDpi,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Result, w};
 
@@ -25,6 +26,8 @@ const WM_APP_STOPPING: u32 = WM_APP + 2;
 
 const BG: COLORREF = rgb(24, 24, 24);
 const HEADER: COLORREF = rgb(45, 45, 48);
+/// Header of the tile that has keyboard focus.
+const HEADER_FOCUSED: COLORREF = rgb(38, 79, 120);
 const PANEL: COLORREF = rgb(32, 32, 34);
 const TEXT: COLORREF = rgb(230, 230, 230);
 const DIM: COLORREF = rgb(150, 150, 150);
@@ -47,6 +50,8 @@ struct Ui {
     pending_stops: usize,
     /// Tile shown alone, filling the window; toggled by double-clicking a tile header.
     zoomed: Option<usize>,
+    /// Tile whose window last received keyboard focus; restored when the host is reactivated.
+    focused: Option<usize>,
     dpi: u32,
     font: HFONT,
 }
@@ -129,6 +134,7 @@ unsafe fn run(cfg: config::Config) -> Result<()> {
                 shutting_down: false,
                 pending_stops: 0,
                 zoomed: None,
+                focused: None,
                 dpi,
                 font: message_font(dpi),
             })
@@ -163,6 +169,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(()) => LRESULT(0),
                 None => DefWindowProcW(hwnd, msg, wp, lp),
             },
+            // A click inside an embedded window. Embedded windows belong to other
+            // processes and don't take focus when clicked, so hand it to them here.
+            WM_PARENTNOTIFY
+                if matches!((wp.0 & 0xFFFF) as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) =>
+            {
+                let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
+                if let Some(target) = with_ui(|ui| ui.focus_target_at(POINT { x, y })).flatten() {
+                    let _ = SetFocus(Some(target));
+                }
+                LRESULT(0)
+            }
+            WM_SETFOCUS => {
+                // The host was activated: give focus back to the tile that last had it.
+                if let Some(target) = with_ui(|ui| ui.focused_window()).flatten() {
+                    let _ = SetFocus(Some(target));
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                // A click on the host itself (a header or empty tile) takes focus off the tiles.
+                if with_ui(|ui| ui.clear_focus()).unwrap_or(false) {
+                    let _ = SetFocus(Some(hwnd));
+                }
+                LRESULT(0)
+            }
             WM_LBUTTONDBLCLK => {
                 let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
                 with_ui(|ui| ui.toggle_zoom_at(POINT { x, y }));
@@ -289,6 +320,40 @@ impl Ui {
         self.zoomed.is_some_and(|z| z != index)
     }
 
+    /// The embedded window under `pt` (host client coordinates), now marked as focused.
+    fn focus_target_at(&mut self, pt: POINT) -> Option<HWND> {
+        let cells = self.cells();
+        let i = (0..self.children.len())
+            .find(|&i| !self.is_hidden(i) && contains(&self.split(&cells[i]).1, pt))?;
+        let hwnd = self.children[i].window.as_ref()?.hwnd;
+        if self.focused != Some(i) {
+            self.focused = Some(i);
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+        }
+        Some(hwnd)
+    }
+
+    fn focused_window(&self) -> Option<HWND> {
+        let i = self.focused?;
+        if self.is_hidden(i) {
+            return None;
+        }
+        self.children.get(i)?.window.as_ref().map(|w| w.hwnd)
+    }
+
+    /// Forget the focused tile. Returns true if one was focused.
+    fn clear_focus(&mut self) -> bool {
+        let had = self.focused.take().is_some();
+        if had {
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+        }
+        had
+    }
+
     fn toggle_zoom_at(&mut self, pt: POINT) {
         let cells = self.cells();
         let hit = cells.iter().enumerate().position(|(i, cell)| {
@@ -298,6 +363,16 @@ impl Ui {
         if let Some(i) = hit {
             self.zoomed = if self.zoomed == Some(i) { None } else { Some(i) };
             self.layout();
+            if self.zoomed == Some(i)
+                && let Some(w) = &self.children[i].window
+            {
+                // Zooming a tile implies working in it.
+                self.focused = Some(i);
+                let hwnd = w.hwnd;
+                unsafe {
+                    let _ = SetFocus(Some(hwnd));
+                }
+            }
         }
     }
 
@@ -346,6 +421,7 @@ impl Ui {
             let _ = GetClientRect(self.hwnd, &mut client);
             let bg = CreateSolidBrush(BG);
             let header = CreateSolidBrush(HEADER);
+            let header_focused = CreateSolidBrush(HEADER_FOCUSED);
             let panel = CreateSolidBrush(PANEL);
             FillRect(hdc, &client, bg);
             let old_font = SelectObject(hdc, self.font.into());
@@ -357,7 +433,7 @@ impl Ui {
                     continue;
                 }
                 let (h, b) = self.split(&cell);
-                FillRect(hdc, &h, header);
+                FillRect(hdc, &h, if self.focused == Some(i) { header_focused } else { header });
                 let text_rc = RECT { left: h.left + pad, right: h.right - pad, ..h };
                 let (status, color) = status_text(c);
                 draw_text(hdc, &status, text_rc, color, DT_RIGHT);
@@ -390,7 +466,7 @@ impl Ui {
             }
 
             SelectObject(hdc, old_font);
-            for brush in [bg, header, panel] {
+            for brush in [bg, header, header_focused, panel] {
                 let _ = DeleteObject(brush.into());
             }
             let _ = EndPaint(self.hwnd, &ps);

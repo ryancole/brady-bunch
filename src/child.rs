@@ -695,7 +695,8 @@ unsafe fn embed(hwnd: HWND, host: HWND) -> Embedded {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let strip = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
-        let ex_strip = WS_EX_APPWINDOW | WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE;
+        // WS_EX_NOPARENTNOTIFY would hide the clicks the host uses to hand over focus.
+        let ex_strip = WS_EX_APPWINDOW | WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_NOPARENTNOTIFY;
         // Style must be WS_CHILD before SetParent.
         SetWindowLongPtrW(hwnd, GWL_STYLE, ((style & !strip.0) | WS_CHILD.0) as i32 as isize);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex_style & !ex_strip.0) as i32 as isize);

@@ -61,7 +61,7 @@ Per `[[app]]`:
 |---|---|---|---|
 | `command` | string | required | Full command line, including arguments. |
 | `name` | string | exe name | Label shown above the tile. |
-| `cwd` | string | host's cwd | Working directory for the app. |
+| `cwd` | string | host's cwd | Working directory for the app. A relative path is relative to the config file's folder. |
 | `console` | bool | auto-detected | Treat as a console app (`true`) or GUI app (`false`). Auto-detection reads the exe's PE header; `.bat`/`.cmd` count as console. |
 | `shutdown` | `"auto"`, `"ctrl-c"`, `"close"` or `"kill"` | `"auto"` | How this app is stopped (see Shutdown). |
 | `shutdown_timeout_ms` | integer | top-level value | Per-app override. |
@@ -153,7 +153,9 @@ For each app, steps escalate. Each step waits up to the app's timeout for every 
 
 ## Tile states
 
-Double-clicking a tile's header zooms that tile to fill the window, hiding the others (their apps keep running). Double-clicking again restores the grid.
+Clicking inside a tile gives that app keyboard focus, so you can type into console prompts; its header turns blue. Clicking a header or empty space returns focus to the host. When the host window is reactivated, focus returns to the tile that last had it.
+
+Double-clicking a tile's header zooms that tile to fill the window, hiding the others (their apps keep running). Zooming a tile also focuses it. Double-clicking again restores the grid.
 
 Each tile's header shows the app name and one of these states:
 
