@@ -133,7 +133,7 @@ If `run`'s task fails, it exits `4`, the task's tile shows its output, and the a
 
 ```json
 {
-  "version": "0.6.0",
+  "version": "0.7.0",
   "host_pid": 1234,
   "started_at": "2026-11-25T17:02:11.408Z",
   "now": "2026-11-25T17:09:45.120Z",

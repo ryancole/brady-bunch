@@ -42,7 +42,7 @@ git push origin v0.1.0
 - **Already running:** with `skip_if_ready = true`, an app whose `ready` check already passes isn't launched and shows `already running`.
 - **Environment:** `%VAR%` in `command`, `cwd`, `env`, `log`, `url`, `ready` and `health` is expanded from the app's `env` and the host's environment. `path_prepend = ['C:\dir1', 'C:\dir2']` and `path_append` add folders to the app's PATH, skipping ones that don't exist.
 - **Shared settings:** a `[defaults]` table sets keys for every `[[app]]`. `--only`/`--skip` pick apps from the command line; `--only` brings in what they depend on. A `[profiles]` table names selections, e.g. `webdev = { skip = ["worker"] }`, used as `--profile webdev`.
-- **Version check:** `min_version = "0.6.0"` makes an older brady-bunch refuse the config with a message saying to update. `brady-ctl --version` prints the version.
+- **Version check:** `min_version = "0.7.0"` makes an older brady-bunch refuse the config with a message saying to update. `brady-ctl --version` prints the version.
 - **Tiling:** the first visible top-level window of any process in the app's job is reparented into a grid cell. If that window closes, for example a splash screen, the next one is picked up.
 - **Keyboard:** click inside a tile to type into it; the focused tile's header turns blue.
 - **One host per config:** launching a config that's already running brings its window to the front instead of starting a second host. `--new-instance` opts out.

@@ -8,7 +8,7 @@ shutdown_timeout_ms = 5000   # per shutdown step, before escalating
 # keep_logs = 1              # previous copies of event_log and each log kept as name.1.log, name.2.log...
 # flash_on_crash = true      # flash the taskbar button when an app crashes
 # remember_layout = true     # restore window position, size and zoomed tile from the last run
-# min_version = "0.6.0"     # refuse to run under an older brady-bunch, with a clear message
+# min_version = "0.7.0"     # refuse to run under an older brady-bunch, with a clear message
 
 # Named selections: brady-bunch.exe brady.toml --profile webdev (or brady-ctl up --profile webdev).
 # [profiles]

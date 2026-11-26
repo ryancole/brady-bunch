@@ -4,6 +4,8 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-25
+
 ### Fixed
 
 - Non-ASCII output of apps with `log` or `ready.log` was garbled in the console (and in `brady-ctl tail`): brady-shim passed the bytes on to a console that read them in its OEM code page, so rspack's `➜` showed as `Γ₧£`. brady-shim now decodes the output and writes it to the console as text, and sets the console to UTF-8 so .NET and cmd write UTF-8 too. The `log` file is always UTF-8, and a `ready.log` regex can match non-ASCII text, including a character split between two reads.
