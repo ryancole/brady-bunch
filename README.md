@@ -1,5 +1,7 @@
 # brady-bunch
 
+![brady-bunch: all your apps, one tiled window](assets/banner.svg)
+
 Launches a list of programs as child processes and tiles their windows inside one host window. Apps can wait for each other to be ready, setup tasks can run first, and closing the host shuts everything down cleanly.
 
 ```
