@@ -4,6 +4,8 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-25
+
 ### Fixed
 
 - Console apps no longer flash on the desktop and in the taskbar as they start. Their console window was created visible and only embedded at the next poll; it is now created hidden and shown once it's in its tile. GUI apps still can show briefly (see Limitations in the README).
