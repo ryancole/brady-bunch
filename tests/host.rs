@@ -2,7 +2,10 @@
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Output};
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 struct Host {
     dir: PathBuf,
@@ -76,7 +79,7 @@ fn a_skipped_task_stays_runnable() {
         &format!(
             "title = 'held task test'\n\
              [profiles]\nquick = {{ skip = ['build'] }}\n\
-             [[task]]\nname = 'build'\ncommand = 'cmd /c echo built> built.txt'\ncwd = '.'\nconsole = false\n\
+             [[task]]\nname = 'build'\ncommand = 'cmd /c echo built> built.txt'\ncwd = '.'\n\
              [[app]]\nname = 'app'\ncommand = '{SLEEP}'\n"
         ),
     );
@@ -100,19 +103,21 @@ fn running_if_finds_an_outside_process_but_not_the_hosts_own() {
     let outside = unique_exe(&dir, "bb-outside");
     let own = unique_exe(&dir, "bb-own");
     let stem = |p: &Path| p.file_stem().unwrap().to_string_lossy().into_owned();
-    let mut external = Command::new(&outside).args(["-n", "300", "127.0.0.1"]).spawn().unwrap();
+    // No console window of its own: it would sit on the desktop for the whole test.
+    let mut external =
+        Command::new(&outside).args(["-n", "300", "127.0.0.1"]).creation_flags(CREATE_NO_WINDOW).spawn().unwrap();
     let host = Host::new(
         "running-if",
         &format!(
             "title = 'running_if test'\n\
-             [[task]]\nname = 'install'\ncommand = 'cmd /c echo installed> installed.txt'\ncwd = '.'\nconsole = false\n\
+             [[task]]\nname = 'install'\ncommand = 'cmd /c echo installed> installed.txt'\ncwd = '.'\n\
              skip_if_running = ['worker']\n\
-             [[task]]\nname = 'setup'\ncommand = 'cmd /c echo set up> setup.txt'\ncwd = '.'\nconsole = false\n\
+             [[task]]\nname = 'setup'\ncommand = 'cmd /c echo set up> setup.txt'\ncwd = '.'\n\
              skip_if_running = ['second']\n\
-             [[app]]\nname = 'worker'\ncommand = '\"{outside}\" -n 300 127.0.0.1'\nconsole = false\n\
+             [[app]]\nname = 'worker'\ncommand = '\"{outside}\" -n 300 127.0.0.1'\n\
              running_if = {{ process = '{outside_name}' }}\n\
-             [[app]]\nname = 'first'\ncommand = '\"{own}\" -n 300 127.0.0.1'\nconsole = false\n\
-             [[app]]\nname = 'second'\ncommand = '\"{own}\" -n 300 127.0.0.1'\nconsole = false\n\
+             [[app]]\nname = 'first'\ncommand = '\"{own}\" -n 300 127.0.0.1'\n\
+             [[app]]\nname = 'second'\ncommand = '\"{own}\" -n 300 127.0.0.1'\n\
              depends_on = ['first']\nrunning_if = {{ process = '{own_path}' }}\n",
             outside = outside.display(),
             outside_name = stem(&outside),
@@ -147,10 +152,10 @@ fn up_changes_a_running_hosts_selection() {
         "select",
         &format!(
             "title = 'selection test'\n\
-             [[task]]\nname = 'build'\ncommand = 'cmd /c exit 0'\nconsole = false\n\
-             [[app]]\nname = 'a'\ncommand = '{SLEEP}'\nconsole = false\n\
-             [[app]]\nname = 'b'\ncommand = '{SLEEP}'\nconsole = false\n\
-             [[app]]\nname = 'c'\ncommand = '{SLEEP}'\nconsole = false\n"
+             [[task]]\nname = 'build'\ncommand = 'cmd /c exit 0'\n\
+             [[app]]\nname = 'a'\ncommand = '{SLEEP}'\n\
+             [[app]]\nname = 'b'\ncommand = '{SLEEP}'\n\
+             [[app]]\nname = 'c'\ncommand = '{SLEEP}'\n"
         ),
     );
     host.ok(&["up", "--skip", "b,c,build", "--timeout", "60"]);
