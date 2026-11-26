@@ -4,6 +4,8 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-25
+
 ### Fixed
 
 - `brady-ctl up` could keep a caller that reads its output to end-of-file (`$out = brady-ctl up ...`, `| Tee-Object`, .NET's `RedirectStandardOutput`) waiting until the host exited. The host it starts no longer inherits any of `up`'s handles, including ones `up` itself inherited from its caller; it gets exactly NUL for stdin and stdout, and a pipe back to `up` for its startup errors.
