@@ -101,7 +101,7 @@ fn config_pipe(config: &Path) -> Option<String> {
 
 /// A stable key for a config file: a hash of its full path, ignoring case and spelling.
 pub fn config_key(config: &Path) -> Option<String> {
-    let canonical = std::fs::canonicalize(config).ok()?;
+    let canonical = std::fs::canonicalize(config::full_path(config)).ok()?;
     let key = canonical.to_string_lossy().to_lowercase();
     // FNV-1a: stable across builds, unlike std's hasher.
     let hash = key.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
@@ -892,7 +892,21 @@ mod tests {
         assert_eq!(config_pipe(&upper).as_ref(), Some(&a));
         assert_eq!(config_pipe(&dotted).as_ref(), Some(&a));
         assert!(config_pipe(&dir.join("missing.toml")).is_none());
+        // With `..` parts, through a folder that doesn't exist.
+        let parent = dir.join("no-such-dir").join("..").join(file.file_name().unwrap());
+        assert_eq!(config_pipe(&parent).as_ref(), Some(&a));
         let _ = std::fs::remove_file(&file);
+        // Relative to the working directory, as `brady-ctl <cmd> brady.toml` gets it.
+        let name = format!("bb-pipe-rel-{}.toml", std::process::id());
+        std::fs::write(&name, "").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let here = cwd.file_name().unwrap().to_string_lossy().into_owned();
+        let abs = config_pipe(&cwd.join(&name)).unwrap();
+        for spelling in [name.clone(), format!(r".\{name}"), format!(r"..\{here}\{name}")] {
+            assert_eq!(config_pipe(&config::resolve_path(Some(spelling.clone().into()))).as_ref(), Some(&abs), "{spelling}");
+            assert_eq!(config_pipe(Path::new(&spelling)).as_ref(), Some(&abs), "{spelling}");
+        }
+        let _ = std::fs::remove_file(&name);
     }
 
     #[test]

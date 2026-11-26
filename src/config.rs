@@ -378,13 +378,14 @@ impl Selection {
 }
 
 /// Explicit path, else `brady.toml` in the working directory, else next to the exe.
+/// Absolute, with `.` and `..` resolved.
 pub fn resolve_path(arg: Option<PathBuf>) -> PathBuf {
     if let Some(p) = arg {
-        return p;
+        return full_path(&p);
     }
     let local = PathBuf::from(DEFAULT_FILE);
     if local.exists() {
-        return local;
+        return full_path(&local);
     }
     std::env::current_exe()
         .ok()
@@ -392,7 +393,14 @@ pub fn resolve_path(arg: Option<PathBuf>) -> PathBuf {
         .unwrap_or(local)
 }
 
+/// `p` made absolute against the working directory, with `.` and `..` resolved the way
+/// GetFullPathName does it: by the text alone, so the path needn't exist.
+pub fn full_path(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 pub fn load(path: &Path, sel: &Selection) -> Result<Loaded, String> {
+    let path = &full_path(path);
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("Could not read config {}: {e}", path.display()))?;
     parse(&text, &config_dir(path), sel).map_err(|e| format!("Invalid config {}:\n\n{e}", path.display()))
@@ -400,7 +408,7 @@ pub fn load(path: &Path, sel: &Selection) -> Result<Loaded, String> {
 
 /// The folder relative paths in the config are relative to.
 fn config_dir(path: &Path) -> PathBuf {
-    std::path::absolute(path).ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default()
+    full_path(path).parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
 /// The config's `event_log`, as an absolute path, read without checking the rest of
@@ -619,8 +627,12 @@ fn env_var(k: &str) -> Option<String> {
     std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
 }
 
+/// `p` relative to `dir` (if it's relative), with `.` and `..` resolved.
 fn absolute_in(dir: &Path, p: &str) -> PathBuf {
-    if Path::new(p).is_relative() { dir.join(p) } else { PathBuf::from(p) }
+    if p.is_empty() {
+        return PathBuf::new();
+    }
+    full_path(&if Path::new(p).is_relative() { dir.join(p) } else { PathBuf::from(p) })
 }
 
 /// Replace `%NAME%` with the variable's value, like cmd.exe: names that aren't set
@@ -843,6 +855,11 @@ pub fn start_order(deps: &[Vec<usize>]) -> Vec<usize> {
     order
 }
 
+/// `items` in start order (see `start_order`); anything not in `deps` is dropped.
+pub fn in_start_order(deps: &[Vec<usize>], items: &[usize]) -> Vec<usize> {
+    start_order(deps).into_iter().filter(|i| items.contains(i)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,34 +874,50 @@ mod tests {
 
     #[test]
     fn relative_paths_resolve_against_config_dir() {
-        let l = load_str(
+        let l = parse(
             r#"
+            event_log = '..\..\.brady\events.log'
             [[app]]
             command = "a"
             cwd = 'src\Api'
-            log = 'logs\a.log'
+            log = '.\logs\..\logs\a.log'
+            path_prepend = ['..\bin']
             [[app]]
             command = "b"
             cwd = '..\other'
             [[app]]
             command = "c"
-            cwd = 'D:\abs'
+            cwd = 'D:\abs\x\..'
             [[app]]
             command = "d"
         "#,
+            Path::new(r"C:\repo\etc\brady"),
+            &Selection::default(),
         )
         .unwrap();
         let cwds: Vec<_> = l.entries.iter().map(|a| a.cwd.clone()).collect();
         assert_eq!(
             cwds,
             [
-                Some(r"C:\repo\src\Api".to_string()),
-                Some(r"C:\repo\..\other".to_string()),
+                Some(r"C:\repo\etc\brady\src\Api".to_string()),
+                Some(r"C:\repo\etc\other".to_string()),
                 Some(r"D:\abs".to_string()),
                 None,
             ]
         );
-        assert_eq!(l.entries[0].log.as_deref(), Some(r"C:\repo\logs\a.log"));
+        assert_eq!(l.entries[0].log.as_deref(), Some(r"C:\repo\etc\brady\logs\a.log"));
+        assert_eq!(l.entries[0].path_prepend, [r"C:\repo\etc\bin"]);
+        assert_eq!(l.event_log.as_deref(), Some(Path::new(r"C:\repo\.brady\events.log")));
+    }
+
+    #[test]
+    fn config_paths_given_any_way_resolve_alike() {
+        let cwd = std::env::current_dir().unwrap();
+        let name = cwd.file_name().unwrap().to_string_lossy().into_owned();
+        let relative = PathBuf::from(format!(r"..\{name}\.\brady.toml"));
+        assert_eq!(resolve_path(Some(relative)), cwd.join("brady.toml"));
+        assert_eq!(resolve_path(Some(PathBuf::from("brady.toml"))), cwd.join("brady.toml"));
+        assert!(!resolve_path(Some(cwd.join(r"a\..\b.toml"))).to_string_lossy().contains(".."));
     }
 
     #[test]
@@ -1183,5 +1216,9 @@ mod tests {
         // 0 depends on 2; 1 has none.
         assert_eq!(start_order(&[vec![2], vec![], vec![]]), [1, 2, 0]);
         assert_eq!(start_order(&[vec![1], vec![0]]), Vec::<usize>::new());
+        // build, api, worker (after api), functions: given in stop order, back in start order.
+        let deps = [vec![], vec![0], vec![0, 1], vec![0]];
+        assert_eq!(in_start_order(&deps, &[3, 2, 1]), [1, 2, 3]);
+        assert_eq!(in_start_order(&deps, &[2, 9]), [2]);
     }
 }

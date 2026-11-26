@@ -188,7 +188,7 @@ If `run`'s task fails, it exits `4`, the task's tile shows its output, and the a
 
 Times are UTC, ISO 8601 with milliseconds; `now` is the host's clock, to compare against. `launched_at` is when the current (or last) run was launched, so after `brady-ctl restart` it tells you whether you're looking at the new process. `ready_at` is when it became ready (for apps without a `ready` check, the launch time; `null` for tasks). `exited_at` is when it exited, failed to launch or was stopped, and is cleared at the next launch. `uptime_ms` is set while it's running. `healthy` is `null` without a `health` check (or before the app is ready), else `true`/`false`. `crashed` is `true` from an exit with a non-zero code or a failed launch (not a stop) until the app is launched again.
 
-`ready` is what dependents wait for. `pid` is the launched process (for console apps, `conhost.exe`) and is `null` when nothing is running. `event_log` and each app's `log` are absolute paths (`null` when not set). To see an app's output, use `brady-ctl tail <app>`, or `log` in the config; for the host's events, `brady-ctl events`.
+`ready` is what dependents wait for. `pid` is the launched process (for console apps, `conhost.exe`) and is `null` when nothing is running. `event_log` and each app's `log` are absolute paths with `.` and `..` resolved (`null` when not set). To see an app's output, use `brady-ctl tail <app>`, or `log` in the config; for the host's events, `brady-ctl events`.
 
 ## Config reference (TOML)
 

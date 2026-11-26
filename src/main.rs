@@ -1000,7 +1000,8 @@ impl Ui {
                 apps.push(i);
             }
         }
-        let order: Vec<usize> = config::start_order(&self.deps).into_iter().rev().filter(|i| apps.contains(i)).collect();
+        let mut order = config::in_start_order(&self.deps, &apps);
+        order.reverse();
         Ok((t, order))
     }
 
@@ -1019,9 +1020,11 @@ impl Ui {
         self.gate();
         self.layout();
         self.invalidate();
+        // `run.apps` is in stop order (dependents first); report them in the order they start.
+        let restarting = config::in_start_order(&self.deps, &run.apps);
         let _ = run.reply.send(Ok(json!({
             "task": self.children[run.task].name,
-            "restarting": run.apps.iter().map(|&i| self.children[i].name.as_str()).collect::<Vec<_>>(),
+            "restarting": restarting.iter().map(|&i| self.children[i].name.as_str()).collect::<Vec<_>>(),
         })));
     }
 
