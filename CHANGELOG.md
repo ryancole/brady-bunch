@@ -4,6 +4,27 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-25
+
+### Added
+
+- `brady-ctl up [config]` checks the config, starts `brady-bunch.exe` for it unless one is already running, and returns once every task is done and every app is ready. If a task or app fails or exits, or `--timeout` (default 300s) passes, it exits with code 4, prints the status JSON and names the app and the reason. Takes `--profile`, `--only` and `--skip`.
+- `brady-ctl down [config|pid]` shuts the host down gracefully and returns once it has exited, printing how each app was stopped. Exits with code 4 if an app had to be killed.
+- `brady-ctl wait <app>` returns once that app is ready, e.g. after `restart`.
+- `brady-ctl run <task>` reruns a task after startup, such as a build. The apps in the task's new `stops` key, and any given with `--stop`, are stopped first (dependents first), so they don't lock the files it writes, and start again once it succeeds. If it fails, they wait for it, and start once it is rerun successfully.
+- `[profiles]` in the config, e.g. `webdev = { skip = ["worker"] }`, used as `--profile webdev`. Profiles combine with each other and with `--only`/`--skip`. `brady-ctl status` shows the active ones.
+- `min_version = "0.6.0"` in the config: an older brady-bunch refuses it with a message saying to update. Unknown-key errors now also say which version is running.
+- `brady-ctl --version` and `brady-bunch.exe --version`, and `version` in `brady-ctl status`.
+- `brady-ctl check [config]` (and `brady-bunch.exe --check`) validates a config without launching anything, including whether each app's exe and `cwd` can be found as a launch would look them up. Problems are printed one per line with the config line number; on success it prints the tasks, apps and start order. Config errors about an entry now also give its line.
+- `--no-dialog`: `brady-bunch.exe` reports a fatal error on stderr and in the event log and exits with code 1, instead of showing a message box. `brady-ctl up` passes it, and prints the error if the host exits before starting.
+- Launching `brady-bunch.exe` for a config that a host is already running brings that host's window to the front and exits, instead of starting a second host. `--new-instance` starts one anyway.
+- `keep_logs` (default 1): when the host starts, the previous `event_log` and app `log` files are kept as `name.1.log`, `name.2.log` and so on.
+- `brady-ctl status` has timestamps (UTC, ISO 8601): the host's `started_at` and `now`, and per app `launched_at`, `ready_at`, `exited_at` and `uptime_ms`.
+- Per-app `health = { interval_ms = 10000, failures = 3 }` keeps running the app's `tcp`/`http` `ready` check after startup. After that many failures in a row the app shows `unhealthy` in its tile and in `status` (`"healthy": false`, with a reason) until a check passes. Changes go to the event log.
+- A crashed app (non-zero exit or failed launch, not a stop) gets a red tile header until it's launched again, and the taskbar button flashes until the window is activated. `flash_on_crash = false` turns off the flashing. `status` shows `crashed`.
+- The window's position, size, maximized state and zoomed tile are saved per config in `%LOCALAPPDATA%\brady-bunch\layouts` and restored on the next start, falling back to the default placement if that monitor is gone. `remember_layout = false` turns this off.
+- `install.ps1`, published with each release: installs or updates brady-bunch into `%LOCALAPPDATA%\Programs\brady-bunch` after checking the release's SHA-256, and adds that folder to the user PATH. It refuses while brady-bunch is running from there.
+
 ## [0.5.1] - 2026-11-25
 
 ### Fixed

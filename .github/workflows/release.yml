@@ -41,12 +41,14 @@ jobs:
         run: |
           $name = "brady-bunch-$env:GITHUB_REF_NAME-x86_64-windows"
           New-Item -ItemType Directory "dist/$name" | Out-Null
-          Copy-Item target/release/brady-bunch.exe, target/release/brady-ctl.exe, target/release/brady-shim.exe, brady.example.toml, README.md, CHANGELOG.md "dist/$name"
+          Copy-Item target/release/brady-bunch.exe, target/release/brady-ctl.exe, target/release/brady-shim.exe, brady.example.toml, README.md, CHANGELOG.md, install.ps1 "dist/$name"
           # Usage guide for AI agents; kept in docs/ so it isn't mistaken for repo instructions.
           Copy-Item docs/AGENTS.md "dist/$name/AGENTS.md"
           Compress-Archive "dist/$name/*" "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           Set-Content "dist/$name.zip.sha256" "$hash  $name.zip" -NoNewline
+          # Also a release asset of its own, for `irm .../releases/latest/download/install.ps1 | iex`.
+          Copy-Item install.ps1 dist/
 
       - name: Publish
         env:

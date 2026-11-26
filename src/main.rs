@@ -1,12 +1,14 @@
 #![windows_subsystem = "windows"]
 
-use brady_bunch::{child, config, control, ctrlc, events, ready};
+use brady_bunch::{child, config, control, ctrlc, events, layout, ready};
 use child::{Child, Readiness, Status, StopBy, StopOutcome};
-use control::{Cmd, Request, WM_APP_CONTROL};
+use control::{Cmd, Reply, Request, WM_APP_CONTROL};
 use ready::Check;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -26,11 +28,15 @@ const WM_APP_STOPPED: u32 = WM_APP + 1;
 const WM_APP_STOPPING: u32 = WM_APP + 2;
 /// Posted when a stop requested with `--stop`/`--restart` has finished.
 const WM_APP_MANUAL_STOPPED: u32 = WM_APP + 3;
+/// Posted when the apps stopped for `run` have all stopped: rerun the task.
+const WM_APP_RUN_GO: u32 = WM_APP + 4;
 
 const BG: COLORREF = rgb(24, 24, 24);
 const HEADER: COLORREF = rgb(45, 45, 48);
 /// Header of the tile that has keyboard focus.
 const HEADER_FOCUSED: COLORREF = rgb(38, 79, 120);
+/// Header of a tile whose app crashed (until it's launched again).
+const HEADER_CRASHED: COLORREF = rgb(120, 36, 36);
 const PANEL: COLORREF = rgb(32, 32, 34);
 const TEXT: COLORREF = rgb(230, 230, 230);
 const DIM: COLORREF = rgb(150, 150, 150);
@@ -43,10 +49,25 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
 }
 
+/// A `brady-ctl run` in progress: stopping apps before the task reruns.
+struct Run {
+    task: usize,
+    /// Apps to start again once the task has been relaunched.
+    apps: Vec<usize>,
+    reply: Reply,
+}
+
 struct Ui {
     hwnd: HWND,
     title: String,
     config_path: PathBuf,
+    selection: config::Selection,
+    started_at: SystemTime,
+    flash_on_crash: bool,
+    remember_layout: bool,
+    /// `brady-ctl down` clients, answered with the final status as the host exits.
+    quit_replies: Vec<Reply>,
+    run: Option<Run>,
     columns: Option<u32>,
     timeout_ms: u64,
     helper_exe: PathBuf,
@@ -92,21 +113,42 @@ fn main() {
     if flag == ctrlc::READ_FLAG {
         std::process::exit(ctrlc::read_main(num(2), num(3)));
     }
-    if control::VERBS.contains(&flag) {
+    if control::VERBS.contains(&flag) || flag == "-V" {
         std::process::exit(control::client_main(&args[1..]));
     }
 
-    let (path, sel) = match parse_launch_args(&args[1..]) {
+    if args.iter().any(|a| a == "--no-dialog") {
+        NO_DIALOG.store(true, Ordering::Relaxed);
+    }
+    let launch = match parse_launch_args(&args[1..]) {
         Ok(a) => a,
         Err(e) => fatal(&e),
     };
-    let path = config::resolve_path(path);
-    let cfg = match config::load(&path, &sel) {
+    let path = config::resolve_path(launch.path);
+    let cfg = match config::load(&path, &launch.sel) {
         Ok(c) => c,
         Err(e) => fatal(&e),
     };
+    // A host is already running this config: show it instead of starting a second one.
+    // Checked before the logs are touched, since they belong to that host.
+    if !launch.new_instance
+        && let Some(status) = control::running_host(&path)
+    {
+        let mut want: Vec<String> = cfg.entries.iter().map(|e| e.name().to_lowercase()).collect();
+        want.sort();
+        if control::app_names(&status) != want {
+            fatal(&format!(
+                "brady-bunch is already running this config (pid {}) with other apps: {}.\n\n\
+                 Close it first, or start with --new-instance to run a second host.",
+                status["host_pid"],
+                control::app_names(&status).join(", ")
+            ));
+        }
+        control::activate(&status);
+        std::process::exit(0);
+    }
     if let Some(log) = &cfg.event_log
-        && let Err(e) = events::init(log)
+        && let Err(e) = events::init(log, cfg.keep_logs)
     {
         fatal(&format!("Could not create event_log {}: {e}", log.display()));
     }
@@ -117,30 +159,51 @@ fn main() {
     events::log("host exiting");
 }
 
-/// `[config] [--only a,b] [--skip c,d]`
-fn parse_launch_args(args: &[String]) -> std::result::Result<(Option<PathBuf>, config::Selection), String> {
+#[derive(Debug, Default)]
+struct LaunchArgs {
+    path: Option<PathBuf>,
+    sel: config::Selection,
+    /// Start even if a host is already running this config.
+    new_instance: bool,
+}
+
+/// `[config] [--profile p] [--only a,b] [--skip c,d] [--new-instance] [--no-dialog]`
+fn parse_launch_args(args: &[String]) -> std::result::Result<LaunchArgs, String> {
     let mut path = None;
     let mut sel = config::Selection::default();
+    let mut new_instance = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let list = |v: Option<&String>| -> std::result::Result<Vec<String>, String> {
-            let v = v.ok_or_else(|| format!("{a} needs a comma-separated list of app names"))?;
+            let v = v.ok_or_else(|| format!("{a} needs a comma-separated list of names"))?;
             Ok(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
         };
         match a.as_str() {
+            "--profile" => sel.profiles.extend(list(it.next())?),
             "--only" => sel.only.extend(list(it.next())?),
             "--skip" => sel.skip.extend(list(it.next())?),
+            "--new-instance" => new_instance = true,
+            "--no-dialog" => {} // Read in main, before anything can fail.
             s if s.starts_with("--") => return Err(format!("Unknown option {s}.")),
             _ if path.is_none() => path = Some(PathBuf::from(a)),
             _ => return Err(format!("Unexpected argument {a}.")),
         }
     }
-    Ok((path, sel))
+    Ok(LaunchArgs { path, sel, new_instance })
 }
 
+/// `--no-dialog`: report fatal errors on stderr and in the event log instead of a
+/// message box, for callers that can't see or dismiss one.
+static NO_DIALOG: AtomicBool = AtomicBool::new(false);
+
 fn fatal(msg: &str) -> ! {
-    unsafe {
-        MessageBoxW(None, &HSTRING::from(msg), w!("Brady Bunch"), MB_ICONERROR | MB_OK);
+    if NO_DIALOG.load(Ordering::Relaxed) {
+        events::log(format!("fatal: {msg}"));
+        eprintln!("brady-bunch: {msg}");
+    } else {
+        unsafe {
+            MessageBoxW(None, &HSTRING::from(msg), w!("Brady Bunch"), MB_ICONERROR | MB_OK);
+        }
     }
     std::process::exit(1)
 }
@@ -179,7 +242,7 @@ unsafe fn run(cfg: config::Loaded, config_path: PathBuf) -> Result<()> {
         let dpi = GetDpiForWindow(hwnd);
         let helper_exe = std::env::current_exe().unwrap_or_default();
         let shim = helper_exe.parent().map(|d| d.join(child::SHIM_EXE)).filter(|p| p.is_file());
-        let ctx = child::Context { shim };
+        let ctx = child::Context { shim, keep_logs: cfg.keep_logs };
         let children: Vec<Child> = cfg.entries.iter().enumerate().map(|(i, e)| Child::new(i, e, &ctx)).collect();
         let n = children.len();
         UI.with(|cell| {
@@ -187,6 +250,12 @@ unsafe fn run(cfg: config::Loaded, config_path: PathBuf) -> Result<()> {
                 hwnd,
                 title: cfg.title.clone(),
                 config_path: std::path::absolute(&config_path).unwrap_or(config_path.clone()),
+                selection: cfg.selection.clone(),
+                started_at: SystemTime::now(),
+                flash_on_crash: cfg.flash_on_crash,
+                remember_layout: cfg.remember_layout,
+                quit_replies: Vec::new(),
+                run: None,
                 columns: cfg.columns,
                 timeout_ms: cfg.shutdown_timeout_ms,
                 helper_exe: helper_exe.clone(),
@@ -208,7 +277,14 @@ unsafe fn run(cfg: config::Loaded, config_path: PathBuf) -> Result<()> {
         with_ui(Ui::gate);
         control::serve(hwnd, &config_path, helper_exe);
 
-        let _ = ShowWindow(hwnd, if cfg.maximized { SW_SHOWMAXIMIZED } else { SW_SHOWDEFAULT });
+        // Where the window was last time, unless that monitor is gone.
+        let saved = if cfg.remember_layout { layout::load(&config_path) } else { None };
+        if let Some(name) = saved.as_ref().and_then(|l| l.zoomed.as_deref()) {
+            with_ui(|ui| ui.zoomed = ui.children.iter().position(|c| c.name.eq_ignore_ascii_case(name)));
+        }
+        if !saved.as_ref().is_some_and(|l| layout::restore(hwnd, l)) {
+            let _ = ShowWindow(hwnd, if cfg.maximized { SW_SHOWMAXIMIZED } else { SW_SHOWDEFAULT });
+        }
         SetTimer(Some(hwnd), TIMER_POLL, POLL_MS, None);
 
         let mut msg = MSG::default();
@@ -220,9 +296,14 @@ unsafe fn run(cfg: config::Loaded, config_path: PathBuf) -> Result<()> {
         UI.with(|cell| {
             if let Some(ui) = cell.borrow_mut().as_mut() {
                 ui.children.iter_mut().for_each(Child::cleanup);
+                let last = ui.status_json();
+                for r in ui.quit_replies.drain(..) {
+                    let _ = r.send(Ok(last.clone()));
+                }
             }
             cell.borrow_mut().take()
         });
+        control::wait_for_final_replies(std::time::Duration::from_secs(2));
         Ok(())
     }
 }
@@ -322,11 +403,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_APP_CONTROL => {
-                // SAFETY: posted by control::ask with a leaked Box<Request>.
+                // SAFETY: posted by control::post with a leaked Box<Request>.
                 let req = Box::from_raw(lp.0 as *mut Request);
                 let Request { cmd, reply } = *req;
-                let result = with_ui(|ui| ui.control(cmd)).unwrap_or_else(|| Err("the host is busy; try again".into()));
-                let _ = reply.send(result);
+                match cmd {
+                    Cmd::Quit => {
+                        // Answered as the host exits; a busy UI drops the reply, which the client sees.
+                        if with_ui(|ui| ui.quit_replies.push(reply)).is_some() {
+                            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                    Cmd::Run { task, stop } => {
+                        with_ui(|ui| ui.start_run(&task, &stop, reply));
+                    }
+                    cmd => {
+                        let result =
+                            with_ui(|ui| ui.control(cmd)).unwrap_or_else(|| Err("the host is busy; try again".into()));
+                        let _ = reply.send(result);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_APP_RUN_GO => {
+                with_ui(Ui::on_run_go);
                 LRESULT(0)
             }
             WM_DPICHANGED => {
@@ -371,6 +470,24 @@ impl Ui {
             relayout |= l;
         }
         repaint |= self.gate();
+        // Take every flag, not just the first.
+        let mut crashed = false;
+        for c in &mut self.children {
+            crashed |= std::mem::take(&mut c.new_crash);
+        }
+        if crashed && self.flash_on_crash && !self.shutting_down {
+            let info = FLASHWINFO {
+                cbSize: size_of::<FLASHWINFO>() as u32,
+                hwnd: self.hwnd,
+                // Until the window is brought to the front.
+                dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            unsafe {
+                let _ = FlashWindowEx(&info);
+            }
+        }
         if relayout || self.shown_tiles() != self.shown {
             self.layout();
         }
@@ -388,8 +505,11 @@ impl Ui {
         // Launching an app without a `ready` check makes it ready at once, which can
         // release the apps that depend on it, so repeat until nothing changes.
         loop {
+            let held = self.run.as_ref().map(|r| r.task);
             let next = (0..self.children.len()).find(|&i| {
-                self.children[i].status == Status::Waiting && self.deps[i].iter().all(|&d| self.children[d].is_ready())
+                self.children[i].status == Status::Waiting
+                    && Some(i) != held
+                    && self.deps[i].iter().all(|&d| self.children[d].is_ready())
             });
             let Some(i) = next else { return any };
             self.children[i].launch();
@@ -543,6 +663,7 @@ impl Ui {
             let bg = CreateSolidBrush(BG);
             let header = CreateSolidBrush(HEADER);
             let header_focused = CreateSolidBrush(HEADER_FOCUSED);
+            let header_crashed = CreateSolidBrush(HEADER_CRASHED);
             let panel = CreateSolidBrush(PANEL);
             FillRect(hdc, &client, bg);
             let old_font = SelectObject(hdc, self.font.into());
@@ -555,7 +676,14 @@ impl Ui {
                 }
                 let c = &self.children[i];
                 let (h, b) = self.split(cell);
-                FillRect(hdc, &h, if self.focused == Some(i) { header_focused } else { header });
+                let brush = if c.crashed {
+                    header_crashed
+                } else if self.focused == Some(i) {
+                    header_focused
+                } else {
+                    header
+                };
+                FillRect(hdc, &h, brush);
                 let text_rc = RECT { left: h.left + pad, right: h.right - pad, ..h };
                 let (status, color) = self.status_text(i);
                 let status_w = text_width(hdc, &status).min((text_rc.right - text_rc.left) / 2);
@@ -591,7 +719,7 @@ impl Ui {
             }
 
             SelectObject(hdc, old_font);
-            for brush in [bg, header, header_focused, panel] {
+            for brush in [bg, header, header_focused, header_crashed, panel] {
                 let _ = DeleteObject(brush.into());
             }
             let _ = EndPaint(self.hwnd, &ps);
@@ -601,6 +729,17 @@ impl Ui {
 
     /// The first dependency of child `i` that isn't ready, with why, e.g. `solr (not ready)`.
     fn waiting_for(&self, i: usize) -> Option<String> {
+        if let Some(run) = self.run.as_ref().filter(|r| r.task == i) {
+            let busy: Vec<&str> = run
+                .apps
+                .iter()
+                .filter(|&&a| matches!(self.children[a].status, Status::StopQueued | Status::Stopping))
+                .map(|&a| self.children[a].name.as_str())
+                .collect();
+            if !busy.is_empty() {
+                return Some(format!("{} to stop", busy.join(", ")));
+            }
+        }
         let d = *self.deps[i].iter().find(|&&d| !self.children[d].is_ready())?;
         let dep = &self.children[d];
         let why = match &dep.status {
@@ -625,6 +764,9 @@ impl Ui {
             },
             Status::Checking => ("checking…".into(), WARN),
             Status::External => ("already running".into(), OK),
+            Status::WaitingForWindow | Status::Running if c.healthy == Some(false) => {
+                (format!("unhealthy (pid {})", c.pid), BAD)
+            }
             Status::WaitingForWindow | Status::Running => match (c.readiness, c.window.is_some()) {
                 (Readiness::Pending, true) => (format!("starting… (pid {})", c.pid), WARN),
                 (Readiness::TimedOut, _) => (format!("not ready (pid {})", c.pid), BAD),
@@ -739,6 +881,16 @@ impl Ui {
                 self.stop_one(i, true);
                 i
             }
+            Cmd::Activate => {
+                unsafe {
+                    if IsIconic(self.hwnd).as_bool() {
+                        let _ = ShowWindow(self.hwnd, SW_RESTORE);
+                    }
+                    let _ = SetForegroundWindow(self.hwnd);
+                }
+                return Ok(json!({ "host_pid": std::process::id() }));
+            }
+            Cmd::Quit | Cmd::Run { .. } => return Err("not handled here".into()),
         };
         self.gate();
         self.invalidate();
@@ -775,6 +927,101 @@ impl Ui {
         }
     }
 
+    /// `brady-ctl run`: stop the apps (dependents first), then rerun the task and start
+    /// them again. Answered once the task has been launched.
+    fn start_run(&mut self, task: &str, stop: &[String], reply: Reply) {
+        let (t, apps) = match self.plan_run(task, stop) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        let names: Vec<&str> = apps.iter().map(|&i| self.children[i].name.as_str()).collect();
+        events::log(format!(
+            "{}: run requested{}",
+            self.children[t].name,
+            if names.is_empty() { String::new() } else { format!("; stopping {}", names.join(", ")) }
+        ));
+        let mut plans = Vec::new();
+        for &i in &apps {
+            if let Some(p) = self.children[i].stop_plan(self.timeout_ms, &self.helper_exe) {
+                plans.push((i, p));
+            }
+        }
+        // Counted like `brady-ctl stop`, so a shutdown meanwhile waits for them.
+        self.manual_stops += plans.len();
+        // Back to waiting, held by `self.run` until the apps have stopped. This also
+        // closes the console kept open from its last run.
+        self.children[t].request_start();
+        self.run = Some(Run { task: t, apps, reply });
+        let host = self.hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let post = |msg, i, lp| unsafe {
+                let _ = PostMessageW(Some(HWND(host as *mut _)), msg, WPARAM(i), LPARAM(lp));
+            };
+            for (i, plan) in plans {
+                post(WM_APP_STOPPING, i, 0);
+                let outcome = plan.run();
+                post(WM_APP_MANUAL_STOPPED, i, encode_outcome(outcome));
+            }
+            post(WM_APP_RUN_GO, 0, 0);
+        });
+        self.layout();
+        self.invalidate();
+    }
+
+    /// The task and the apps to stop for `run`, dependents first.
+    fn plan_run(&self, task: &str, stop: &[String]) -> std::result::Result<(usize, Vec<usize>), String> {
+        if self.shutting_down {
+            return Err("the host is shutting down".into());
+        }
+        if self.run.is_some() {
+            return Err("another run is still stopping apps".into());
+        }
+        let t = self.find(task)?;
+        let name = &self.children[t].name;
+        if !self.children[t].cfg.task {
+            return Err(format!("{name} is an app, not a task; use brady-ctl restart {name}"));
+        }
+        if let Some(busy) = self.children.iter().find(|c| c.cfg.task && c.is_active()) {
+            return Err(format!("the task {} is still running; wait for it to finish", busy.name));
+        }
+        let mut apps = Vec::new();
+        for n in self.children[t].cfg.stops.iter().chain(stop) {
+            let i = self.find(n)?;
+            if self.children[i].cfg.task {
+                return Err(format!("{} is a task; only apps can be stopped", self.children[i].name));
+            }
+            if !apps.contains(&i) {
+                apps.push(i);
+            }
+        }
+        let order: Vec<usize> = config::start_order(&self.deps).into_iter().rev().filter(|i| apps.contains(i)).collect();
+        Ok((t, order))
+    }
+
+    /// The apps for `run` have stopped: let the task run, and queue the apps behind it.
+    fn on_run_go(&mut self) {
+        let Some(run) = self.run.take() else { return };
+        if self.shutting_down {
+            let _ = run.reply.send(Err("the host is shutting down".into()));
+            return;
+        }
+        for &i in &run.apps {
+            if self.children[i].can_restart() {
+                self.children[i].request_start();
+            }
+        }
+        self.gate();
+        self.layout();
+        self.invalidate();
+        let _ = run.reply.send(Ok(json!({
+            "task": self.children[run.task].name,
+            "restarting": run.apps.iter().map(|&i| self.children[i].name.as_str()).collect::<Vec<_>>(),
+        })));
+    }
+
     fn on_manual_stopped(&mut self, index: usize, outcome: StopOutcome) -> bool {
         self.manual_stops = self.manual_stops.saturating_sub(1);
         if let Some(c) = self.children.get_mut(index) {
@@ -794,9 +1041,15 @@ impl Ui {
 
     fn status_json(&self) -> Value {
         json!({
+            "version": config::VERSION,
             "host_pid": std::process::id(),
+            "started_at": events::iso_utc(self.started_at),
+            "now": events::iso_utc(SystemTime::now()),
             "config": self.config_path.to_string_lossy(),
             "title": self.title,
+            "profiles": self.selection.profiles,
+            "only": self.selection.only,
+            "skip": self.selection.skip,
             "shutting_down": self.shutting_down,
             "apps": (0..self.children.len()).map(|i| self.app_json(i)).collect::<Vec<_>>(),
         })
@@ -809,6 +1062,9 @@ impl Ui {
             Status::Waiting => ("waiting", self.waiting_for(i).map(|w| format!("waiting for {w}"))),
             Status::Checking => ("checking", check.map(|w| format!("checking whether {w} already answers"))),
             Status::External => ("external", check.map(|w| format!("{w} already answered, so it wasn't launched"))),
+            Status::WaitingForWindow | Status::Running if c.healthy == Some(false) => {
+                ("unhealthy", c.unhealthy_reason())
+            }
             Status::WaitingForWindow | Status::Running => match c.readiness {
                 Readiness::Pending => ("starting", check.map(|w| format!("waiting for {w}"))),
                 Readiness::TimedOut => (
@@ -846,6 +1102,12 @@ impl Ui {
             "url": c.cfg.url,
             "log": c.cfg.log,
             "last_stop": c.last_stop.map(|s| json!({ "by": s.by.as_str(), "ms": s.ms })),
+            "healthy": c.healthy,
+            "crashed": c.crashed,
+            "launched_at": c.launched_at.map(events::iso_utc),
+            "ready_at": c.ready_at.map(events::iso_utc),
+            "exited_at": c.exited_at.map(events::iso_utc),
+            "uptime_ms": c.is_active().then(|| c.launched_at.and_then(|t| t.elapsed().ok())).flatten().map(|d| d.as_millis() as u64),
         })
     }
 
@@ -863,6 +1125,12 @@ impl Ui {
         }
         self.shutting_down = true;
         events::log("shutdown requested");
+        if self.remember_layout {
+            let zoomed = self.zoomed.map(|i| self.children[i].name.clone());
+            if let Some(l) = layout::capture(self.hwnd, zoomed) {
+                layout::save(&self.config_path, &l);
+            }
+        }
         unsafe {
             let _ = SetWindowTextW(self.hwnd, &HSTRING::from(format!("{} — shutting down…", self.title)));
         }
@@ -1044,10 +1312,13 @@ mod tests {
     fn launch_args() {
         let args: Vec<String> =
             ["webdev.toml", "--skip", "worker, functions", "--only", "api"].iter().map(|s| s.to_string()).collect();
-        let (path, sel) = parse_launch_args(&args).unwrap();
-        assert_eq!(path, Some(PathBuf::from("webdev.toml")));
-        assert_eq!(sel.skip, ["worker", "functions"]);
-        assert_eq!(sel.only, ["api"]);
+        let a = parse_launch_args(&args).unwrap();
+        assert_eq!(a.path, Some(PathBuf::from("webdev.toml")));
+        assert_eq!(a.sel.skip, ["worker", "functions"]);
+        assert_eq!(a.sel.only, ["api"]);
+        assert!(!a.new_instance);
         assert!(parse_launch_args(&["--bogus".to_string()]).is_err());
+        let a = parse_launch_args(&["--new-instance".to_string(), "--no-dialog".to_string()]).unwrap();
+        assert!(a.new_instance && a.path.is_none());
     }
 }

@@ -5,6 +5,16 @@ shutdown_timeout_ms = 5000   # per shutdown step, before escalating
 # columns = 3                # default: ceil(sqrt(number of apps))
 # maximized = true
 # event_log = 'brady-events.log'   # launches, exits, readiness, each shutdown step
+# keep_logs = 1              # previous copies of event_log and each log kept as name.1.log, name.2.log...
+# flash_on_crash = true      # flash the taskbar button when an app crashes
+# remember_layout = true     # restore window position, size and zoomed tile from the last run
+# min_version = "0.6.0"     # refuse to run under an older brady-bunch, with a clear message
+
+# Named selections: brady-bunch.exe brady.toml --profile webdev (or brady-ctl up --profile webdev).
+# [profiles]
+# webdev = { skip = ["worker"] }
+# quick = { skip = ["build"] }      # tasks can be skipped too
+# api-only = { only = ["api"] }     # only also brings in what the apps depend on
 
 # Per-app keys shared by every [[app]]; an app's own value wins.
 # [defaults]
@@ -16,6 +26,7 @@ shutdown_timeout_ms = 5000   # per shutdown step, before escalating
 # [[task]]
 # name = "build"
 # command = 'dotnet build src\App.sln -nodeReuse:false'
+# stops = ["api"]           # brady-ctl run build stops these first (they lock the output) and restarts them
 
 [[app]]
 name = "ping"
@@ -41,6 +52,7 @@ command = "charmap.exe"
 # restart_delay_ms = 1000    # doubles up to 30s while the app keeps exiting quickly
 # depends_on = ["ping"]      # start once these apps are ready
 # ready = { tcp = 8080 }     # or { http = "https://localhost:8002" } or { log = 'Now listening on' }; plus timeout_ms
+# health = { interval_ms = 10000, failures = 3 }   # keep running the tcp/http ready check; show unhealthy when it keeps failing
 # skip_if_ready = true       # don't launch if the ready check already passes (started elsewhere)
 # log = 'logs\charmap.log'   # copy console output to a file
 # quick_edit = true          # allow mouse selection in the console (off by default)

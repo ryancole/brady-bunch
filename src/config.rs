@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_FILE: &str = "brady.toml";
 
+/// This build's version, e.g. `0.6.0`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// How a child is asked to exit when the host shuts down.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -67,6 +70,26 @@ pub struct ReadyConfig {
 
 pub const DEFAULT_READY_TIMEOUT_MS: u64 = 60_000;
 
+/// Keep running the `ready` check after the app is ready.
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HealthConfig {
+    /// Time between checks.
+    #[serde(default = "default_health_interval")]
+    pub interval_ms: u64,
+    /// Failures in a row before the app counts as unhealthy.
+    #[serde(default = "default_health_failures")]
+    pub failures: u32,
+}
+
+fn default_health_interval() -> u64 {
+    10_000
+}
+
+fn default_health_failures() -> u32 {
+    3
+}
+
 /// Raw config file layout. Only used to report errors with line numbers; the real
 /// parse happens after `[defaults]` are merged into each app.
 #[derive(Deserialize, Debug)]
@@ -83,6 +106,22 @@ pub struct Config {
     pub maximized: bool,
     /// File the host writes its own events to (launches, exits, readiness, shutdown).
     pub event_log: Option<String>,
+    /// How many previous copies of `event_log` and each app's `log` to keep
+    /// (`events.1.log`, `events.2.log`, ...) when the host starts.
+    #[serde(default = "default_keep_logs")]
+    pub keep_logs: u32,
+    /// Flash the taskbar button when an app crashes.
+    #[serde(default = "yes")]
+    pub flash_on_crash: bool,
+    /// Restore the window's position, size and zoomed tile from the last run.
+    #[serde(default = "yes")]
+    pub remember_layout: bool,
+    /// Oldest brady-bunch that can run this config, e.g. `"0.6.0"`. Checked first.
+    #[allow(dead_code)] // Checked from the raw table, before the typed parse.
+    pub min_version: Option<String>,
+    /// Named app selections for `--profile`.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     #[allow(dead_code)] // Parsed for validation; merged from the raw table.
     pub defaults: Option<Defaults>,
@@ -90,6 +129,16 @@ pub struct Config {
     pub tasks: Vec<TaskConfig>,
     #[serde(rename = "app", default)]
     pub apps: Vec<AppConfig>,
+}
+
+/// A `[profiles]` entry: `webdev = { skip = ["worker"] }`.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    #[serde(default)]
+    pub only: Vec<String>,
+    #[serde(default)]
+    pub skip: Vec<String>,
 }
 
 /// Keys of `[defaults]`: the per-app keys that make sense to share.
@@ -137,6 +186,9 @@ pub struct AppConfig {
     /// Don't launch the app if its `ready` check already passes.
     #[serde(default)]
     pub skip_if_ready: bool,
+    /// Keep running the `ready` check after startup, and show the app as unhealthy
+    /// when it keeps failing.
+    pub health: Option<HealthConfig>,
     /// Copy the app's console output to this file.
     pub log: Option<String>,
     /// Leave the console's QuickEdit mode as the user's console defaults have it.
@@ -147,6 +199,12 @@ pub struct AppConfig {
     /// A `[[task]]`: runs to completion before the apps start.
     #[serde(skip)]
     pub task: bool,
+    /// Tasks: apps that `brady-ctl run` stops while the task reruns, then starts again.
+    #[serde(skip)]
+    pub stops: Vec<String>,
+    /// Line of the entry's `[[app]]` or `[[task]]` header in the config, for messages.
+    #[serde(skip)]
+    pub line: usize,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -166,6 +224,9 @@ pub struct TaskConfig {
     #[serde(default)]
     pub shutdown: Shutdown,
     pub shutdown_timeout_ms: Option<u64>,
+    /// Apps to stop while `brady-ctl run` reruns this task, e.g. ones that lock its output.
+    #[serde(default)]
+    pub stops: Vec<String>,
 }
 
 fn task_exit_with() -> ExitWith {
@@ -186,6 +247,7 @@ impl From<TaskConfig> for AppConfig {
             shutdown: t.shutdown,
             shutdown_timeout_ms: t.shutdown_timeout_ms,
             task: true,
+            stops: t.stops,
             ..Default::default()
         }
     }
@@ -199,6 +261,14 @@ impl AppConfig {
     pub fn ready_timeout_ms(&self) -> u64 {
         self.ready.as_ref().and_then(|r| r.timeout_ms).unwrap_or(DEFAULT_READY_TIMEOUT_MS)
     }
+}
+
+fn default_keep_logs() -> u32 {
+    1
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_title() -> String {
@@ -217,16 +287,36 @@ pub struct Loaded {
     pub columns: Option<u32>,
     pub maximized: bool,
     pub event_log: Option<PathBuf>,
+    pub keep_logs: u32,
+    pub flash_on_crash: bool,
+    pub remember_layout: bool,
     pub entries: Vec<AppConfig>,
     /// For each entry, the indices of the entries it waits for.
     pub deps: Vec<Vec<usize>>,
+    /// The selection the entries were picked with, profile names as the config spells them.
+    pub selection: Selection,
 }
 
-/// `--only` / `--skip` from the command line.
-#[derive(Debug, Default, Clone)]
+/// `--profile`, `--only` and `--skip` from the command line.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Selection {
+    pub profiles: Vec<String>,
     pub only: Vec<String>,
     pub skip: Vec<String>,
+}
+
+impl Selection {
+    /// Command-line arguments that make the same selection.
+    pub fn to_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        for (flag, list) in [("--profile", &self.profiles), ("--only", &self.only), ("--skip", &self.skip)] {
+            if !list.is_empty() {
+                args.push(flag.to_string());
+                args.push(list.join(","));
+            }
+        }
+        args
+    }
 }
 
 /// Explicit path, else `brady.toml` in the working directory, else next to the exe.
@@ -255,13 +345,22 @@ pub fn load(path: &Path, sel: &Selection) -> Result<Loaded, String> {
 }
 
 fn parse(text: &str, config_dir: &Path, sel: &Selection) -> Result<Loaded, String> {
+    let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    // Before anything else, so a config using newer keys says to upgrade.
+    check_min_version(table.get("min_version"))?;
     // First pass: for error messages with line numbers.
-    let raw: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+    let raw: Config = toml::from_str(text).map_err(|e| {
+        let e = e.to_string();
+        if e.contains("unknown field") {
+            format!("{e}\nThis is brady-bunch {VERSION}; a key added in a newer version needs a newer brady-bunch.")
+        } else {
+            e
+        }
+    })?;
     if raw.apps.is_empty() {
         return Err("There are no [[app]] entries.".into());
     }
     // Second pass: merge [defaults] into each app, then parse for real.
-    let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
     if let Some(toml::Value::Table(defaults)) = table.remove("defaults")
         && let Some(toml::Value::Array(apps)) = table.get_mut("app")
     {
@@ -274,11 +373,27 @@ fn parse(text: &str, config_dir: &Path, sel: &Selection) -> Result<Loaded, Strin
     let host_env = |k: &str| env_var(k);
     let mut entries: Vec<AppConfig> =
         cfg.tasks.into_iter().map(AppConfig::from).chain(cfg.apps).collect();
+    let header_lines = |header: &str| -> Vec<usize> {
+        text.lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with(header))
+            .map(|(i, _)| i + 1)
+            .collect()
+    };
+    let (task_lines, app_lines) = (header_lines("[[task]]"), header_lines("[[app]]"));
+    let mut lines = task_lines.into_iter().chain(app_lines);
     for e in &mut entries {
         resolve_entry(e, config_dir);
+        e.line = lines.next().unwrap_or(0);
     }
     let deps = dependencies(&entries)?;
-    let (entries, deps) = select(entries, deps, sel)?;
+    let selection = with_profiles(&cfg.profiles, sel, &entries)?;
+    let (mut entries, deps) = select(entries, deps, &selection)?;
+    // Apps a task stops may have been left out by the selection.
+    let kept: Vec<String> = entries.iter().map(|e| e.name().to_string()).collect();
+    for e in &mut entries {
+        e.stops.retain(|n| kept.iter().any(|k| k.eq_ignore_ascii_case(n)));
+    }
     check_cycles(&deps, &entries)?;
     let event_log = cfg.event_log.map(|p| absolute_in(config_dir, &expand(&p, &host_env)));
     Ok(Loaded {
@@ -287,9 +402,67 @@ fn parse(text: &str, config_dir: &Path, sel: &Selection) -> Result<Loaded, Strin
         columns: cfg.columns,
         maximized: cfg.maximized,
         event_log,
+        keep_logs: cfg.keep_logs,
+        flash_on_crash: cfg.flash_on_crash,
+        remember_layout: cfg.remember_layout,
         entries,
         deps,
+        selection: Selection { profiles: selection.profiles, ..sel.clone() },
     })
+}
+
+/// `min_version = "0.6.0"`: refuse to run under an older brady-bunch.
+fn check_min_version(v: Option<&toml::Value>) -> Result<(), String> {
+    let Some(v) = v else { return Ok(()) };
+    let wanted = v.as_str().and_then(parse_version).ok_or("min_version must be a version like \"0.6.0\".")?;
+    let have = parse_version(VERSION).unwrap_or_default();
+    if have < wanted {
+        let w = v.as_str().unwrap_or_default();
+        return Err(format!("This config needs brady-bunch {w} or newer; this is {VERSION}. Update brady-bunch to run it."));
+    }
+    Ok(())
+}
+
+/// `1.2.3` (or `1.2`, `1`) as comparable numbers.
+pub fn parse_version(s: &str) -> Option<[u32; 3]> {
+    let mut out = [0; 3];
+    let mut parts = s.trim().trim_start_matches('v').split('.');
+    for slot in &mut out {
+        match parts.next() {
+            Some(p) => *slot = p.parse().ok()?,
+            None => break,
+        }
+    }
+    parts.next().is_none().then_some(out)
+}
+
+/// Fold the named profiles' `only`/`skip` into the selection. Profile names are
+/// case-insensitive; the result carries them as the config spells them.
+fn with_profiles(
+    profiles: &BTreeMap<String, Profile>,
+    sel: &Selection,
+    entries: &[AppConfig],
+) -> Result<Selection, String> {
+    let mut out = Selection { profiles: Vec::new(), only: sel.only.clone(), skip: sel.skip.clone() };
+    for name in &sel.profiles {
+        let Some((key, p)) = profiles.iter().find(|(k, _)| k.eq_ignore_ascii_case(name.trim())) else {
+            let known: Vec<&str> = profiles.keys().map(String::as_str).collect();
+            return Err(if known.is_empty() {
+                format!("There is no profile called \"{name}\"; the config has no [profiles].")
+            } else {
+                format!("There is no profile called \"{name}\"; the profiles are: {}.", known.join(", "))
+            });
+        };
+        for n in p.only.iter().chain(&p.skip) {
+            find(entries, n).map_err(|e| format!("Profile {key}: {e}"))?;
+        }
+        if !out.profiles.contains(key) {
+            out.profiles.push(key.clone());
+        }
+        out.only.extend(p.only.iter().cloned());
+        out.skip.extend(p.skip.iter().cloned());
+    }
+    Ok(out)
 }
 
 fn apply_defaults(app: &mut toml::Table, defaults: &toml::Table) {
@@ -399,6 +572,11 @@ pub fn find(entries: &[AppConfig], name: &str) -> Result<usize, String> {
     }
 }
 
+/// `line 12: ` for messages about an entry.
+fn at(e: &AppConfig) -> String {
+    if e.line > 0 { format!("line {}: ", e.line) } else { String::new() }
+}
+
 /// What each entry waits for: every earlier task, plus its `depends_on`.
 fn dependencies(entries: &[AppConfig]) -> Result<Vec<Vec<usize>>, String> {
     let tasks: Vec<usize> = (0..entries.len()).filter(|&i| entries[i].task).collect();
@@ -410,22 +588,31 @@ fn dependencies(entries: &[AppConfig]) -> Result<Vec<Vec<usize>>, String> {
             deps = deps.last().copied().into_iter().collect();
         }
         for d in &e.depends_on {
-            let j = find(entries, d).map_err(|err| format!("{} depends_on: {err}", e.name()))?;
+            let j = find(entries, d).map_err(|err| format!("{}{} depends_on: {err}", at(e), e.name()))?;
             if j == i {
-                return Err(format!("{} depends on itself.", e.name()));
+                return Err(format!("{}{} depends on itself.", at(e), e.name()));
             }
             if entries[j].task {
-                return Err(format!("{} depends on the task {}; apps always wait for every task.", e.name(), d));
+                return Err(format!("{}{} depends on the task {}; apps always wait for every task.", at(e), e.name(), d));
             }
             if !deps.contains(&j) {
                 deps.push(j);
             }
         }
         if let Some(r) = &e.ready {
-            check_ready(e.name(), r)?;
+            check_ready(e.name(), r).map_err(|err| format!("{}{err}", at(e)))?;
+        }
+        for n in &e.stops {
+            let j = find(entries, n).map_err(|err| format!("{}{} stops: {err}", at(e), e.name()))?;
+            if entries[j].task {
+                return Err(format!("{}{} stops the task {n}; only apps can be stopped.", at(e), e.name()));
+            }
         }
         if e.skip_if_ready && !e.ready.as_ref().is_some_and(|r| r.tcp.is_some() || r.http.is_some()) {
-            return Err(format!("{}: skip_if_ready needs a `ready` check with tcp or http.", e.name()));
+            return Err(format!("{}{}: skip_if_ready needs a `ready` check with tcp or http.", at(e), e.name()));
+        }
+        if e.health.is_some() && !e.ready.as_ref().is_some_and(|r| r.tcp.is_some() || r.http.is_some()) {
+            return Err(format!("{}{}: health needs a `ready` check with tcp or http.", at(e), e.name()));
         }
         all.push(deps);
     }
@@ -687,6 +874,20 @@ mod tests {
     }
 
     #[test]
+    fn errors_name_the_entry_line_and_health_needs_a_network_check() {
+        let text = "title = \"x\"\n\n[[app]]\nname = \"a\"\ncommand = \"a\"\n\n[[app]]\nname = \"b\"\ncommand = \"b\"\ndepends_on = [\"zz\"]\n";
+        let err = load_str(text).unwrap_err();
+        assert!(err.starts_with("line 7: b depends_on"), "{err}");
+        let health = "[[app]]\ncommand = \"a\"\nhealth = {}\n";
+        assert!(load_str(health).unwrap_err().contains("health needs a `ready` check"));
+        let ok = "[[app]]\ncommand = \"a\"\nready = { tcp = 1 }\nhealth = { interval_ms = 500 }\n";
+        let h = load_str(ok).unwrap().entries[0].health.clone().unwrap();
+        assert_eq!((h.interval_ms, h.failures), (500, 3));
+        let l = load_str("keep_logs = 3\nflash_on_crash = false\n[[app]]\ncommand = \"a\"\n").unwrap();
+        assert_eq!((l.keep_logs, l.flash_on_crash, l.remember_layout), (3, false, true));
+    }
+
+    #[test]
     fn ready_needs_exactly_one_check() {
         let e = load_str("[[app]]\ncommand='a'\nready = { timeout_ms = 5 }\n").unwrap_err();
         assert!(e.contains("exactly one"), "{e}");
@@ -723,9 +924,60 @@ mod tests {
         command = "n"
     "#;
 
+    fn with_profiles_table(extra: &str) -> String {
+        format!(
+            "{STACK}\n[profiles]\nwebdev = {{ skip = [\"worker\"] }}\nquick = {{ skip = [\"build\"] }}\n{extra}"
+        )
+    }
+
+    #[test]
+    fn profiles_merge_with_each_other_and_the_command_line() {
+        let text = with_profiles_table("");
+        let sel = Selection {
+            profiles: vec!["WebDev".into(), "quick".into()],
+            skip: vec!["web".into()],
+            ..Default::default()
+        };
+        let l = parse(&text, Path::new("C:\\"), &sel).unwrap();
+        assert_eq!(names(&l), ["solr", "azurite", "api"]);
+        assert_eq!(l.selection.profiles, ["webdev", "quick"]);
+        assert_eq!(l.selection.skip, ["web"]);
+        let sel = Selection { profiles: vec!["nope".into()], ..Default::default() };
+        let err = parse(&text, Path::new("C:\\"), &sel).unwrap_err();
+        assert!(err.contains("quick, webdev"), "{err}");
+        let bad = with_profiles_table("broken = { skip = [\"missing\"] }");
+        let sel = Selection { profiles: vec!["broken".into()], ..Default::default() };
+        assert!(parse(&bad, Path::new("C:\\"), &sel).unwrap_err().contains("Profile broken"));
+    }
+
+    #[test]
+    fn min_version_is_checked_before_unknown_keys() {
+        let text = format!("min_version = \"999.0\"\nbrand_new_key = 1\n{STACK}");
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("needs brady-bunch 999.0 or newer"), "{err}");
+        let text = format!("min_version = \"{VERSION}\"\n{STACK}");
+        assert!(load_str(&text).is_ok());
+        assert!(load_str(&format!("min_version = \"soon\"\n{STACK}")).is_err());
+        let err = load_str(&format!("brand_new_key = 1\n{STACK}")).unwrap_err();
+        assert!(err.contains("needs a newer brady-bunch"), "{err}");
+        assert!(parse_version("0.10.2").unwrap() > parse_version("0.9").unwrap());
+    }
+
+    #[test]
+    fn task_stops_must_name_apps_and_follow_the_selection() {
+        let text = STACK.replace("command = \"b\"", "command = \"b\"\nstops = [\"api\", \"worker\"]");
+        let sel = Selection { skip: vec!["worker".into()], ..Default::default() };
+        let l = parse(&text, Path::new("C:\\"), &sel).unwrap();
+        assert_eq!(l.entries[0].stops, ["api"]);
+        let bad = STACK.replace("command = \"b\"", "command = \"b\"\nstops = [\"nope\"]");
+        assert!(load_str(&bad).unwrap_err().contains("build stops"));
+        let app_stops = STACK.replace("command = \"s\"", "command = \"s\"\nstops = [\"api\"]");
+        assert!(load_str(&app_stops).is_err(), "stops is only for tasks");
+    }
+
     #[test]
     fn only_keeps_dependencies_and_tasks() {
-        let sel = Selection { only: vec!["API".into()], skip: vec![] };
+        let sel = Selection { only: vec!["API".into()], ..Default::default() };
         let l = parse(STACK, Path::new("C:\\"), &sel).unwrap();
         assert_eq!(names(&l), ["build", "solr", "azurite", "api"]);
         assert_eq!(l.deps[3], [0, 1, 2]);
@@ -733,11 +985,11 @@ mod tests {
 
     #[test]
     fn skip_drops_apps_and_dependencies_on_them() {
-        let sel = Selection { only: vec![], skip: vec!["worker".into(), "azurite".into(), "build".into()] };
+        let sel = Selection { skip: vec!["worker".into(), "azurite".into(), "build".into()], ..Default::default() };
         let l = parse(STACK, Path::new("C:\\"), &sel).unwrap();
         assert_eq!(names(&l), ["solr", "api", "web"]);
         assert_eq!(l.deps, [vec![], vec![0], vec![]]);
-        let sel = Selection { only: vec![], skip: vec!["nope".into()] };
+        let sel = Selection { skip: vec!["nope".into()], ..Default::default() };
         assert!(parse(STACK, Path::new("C:\\"), &sel).is_err());
     }
 

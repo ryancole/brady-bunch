@@ -4,13 +4,13 @@
 use crate::config::{AppConfig, ExitWith, Restart, Shutdown};
 use crate::ctrlc;
 use crate::events;
-use crate::ready::{self, Check, ProbeGuard};
+use crate::ready::{self, Check, HealthGuard, ProbeGuard};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WPARAM};
 use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 use windows::Win32::System::JobObjects::{
@@ -118,6 +118,8 @@ pub struct Embedded {
 pub struct Context {
     /// brady-shim.exe, if it's next to the host.
     pub shim: Option<PathBuf>,
+    /// Previous copies of each `log` to keep (`keep_logs`).
+    pub keep_logs: u32,
 }
 
 pub struct Child {
@@ -152,6 +154,19 @@ pub struct Child {
     /// The console was kept open after the app exited; its holder process.
     keeper: Option<Handle>,
     pub last_stop: Option<StopOutcome>,
+    /// When the current (or last) run was launched, became ready, and exited or stopped.
+    pub launched_at: Option<SystemTime>,
+    pub ready_at: Option<SystemTime>,
+    pub exited_at: Option<SystemTime>,
+    /// The app exited on its own with a non-zero code, or failed to launch, and hasn't
+    /// been launched since. Its tile header is red.
+    pub crashed: bool,
+    /// Set with `crashed`; the host takes it to flash its taskbar button once.
+    pub new_crash: bool,
+    /// `health`: the watch running the `ready` check after startup.
+    health: Option<HealthGuard>,
+    /// What the health watch last reported, while one is running.
+    pub healthy: Option<bool>,
 }
 
 const DEFAULT_RESTART_DELAY: Duration = Duration::from_millis(1000);
@@ -175,10 +190,14 @@ impl Child {
             ),
             (None, false) => (None, false),
         };
-        // Each host run starts the copy afresh; restarts append to it.
+        // Each host run starts the copy afresh, keeping the last runs' copies; restarts
+        // append to it.
         if let Some(p) = &capture {
             if let Some(dir) = p.parent() {
                 let _ = std::fs::create_dir_all(dir);
+            }
+            if !capture_is_temp {
+                events::rotate(p, ctx.keep_logs);
             }
             let _ = std::fs::File::create(p);
         }
@@ -206,6 +225,13 @@ impl Child {
             capture_is_temp,
             keeper: None,
             last_stop: None,
+            launched_at: None,
+            ready_at: None,
+            exited_at: None,
+            crashed: false,
+            new_crash: false,
+            health: None,
+            healthy: None,
         };
         child.backoff = child.base_delay();
         child
@@ -254,6 +280,12 @@ impl Child {
                 self.main = Some(l.main);
                 self.pid = l.pid;
                 self.readiness = Readiness::NoCheck;
+                self.launched_at = Some(SystemTime::now());
+                self.ready_at = None;
+                self.exited_at = None;
+                self.crashed = false;
+                self.health = None;
+                self.healthy = None;
                 if let Some(r) = &self.cfg.ready {
                     let log = self.capture.clone().zip(log_offset);
                     if let Some(check) = Check::from_config(r, log) {
@@ -262,10 +294,16 @@ impl Child {
                         self.ready_deadline = Instant::now() + Duration::from_millis(self.cfg.ready_timeout_ms());
                     }
                 }
+                if self.readiness == Readiness::NoCheck && !self.cfg.task {
+                    self.ready_at = self.launched_at;
+                }
             }
             Err(e) => {
                 events::log(format!("{}: failed to launch: {e}", self.name));
                 self.status = Status::Failed(e);
+                self.exited_at = Some(SystemTime::now());
+                self.crashed = true;
+                self.new_crash = true;
                 self.schedule_restart();
             }
         }
@@ -273,26 +311,12 @@ impl Child {
 
     fn try_launch(&self) -> std::result::Result<Launched, String> {
         let cfg = &self.cfg;
-        let token = crate::config::first_token(&cfg.command);
-        let exe = resolve_exe(&token, cfg.cwd.as_deref(), &effective_path(&cfg.env)).ok_or_else(|| {
-            format!("{token} not found in the app's folder or on PATH (run .cmd files and shell commands through cmd /c)")
-        })?;
-        if let Some(cwd) = &cfg.cwd
-            && !Path::new(cwd).is_dir()
-        {
-            return Err(format!("working directory {cwd} doesn't exist"));
-        }
+        let exe = preflight(cfg, self.console, self.shim.is_some(), self.capture.is_some())?;
         // Only hand CreateProcess an application name for real executables; batch
         // files are run by the command interpreter, which it starts itself.
         let app = exe.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe") || e.eq_ignore_ascii_case("com"));
         let app = app.then_some(exe.as_path());
         let shim = self.shim.as_deref().filter(|_| self.console);
-        if !self.console && self.capture.is_some() {
-            return Err("log and ready.log only work for console apps".into());
-        }
-        if self.console && shim.is_none() && self.capture.is_some() {
-            return Err(format!("{SHIM_EXE} is missing next to brady-bunch.exe; it's needed for log and ready.log"));
-        }
         let launch = LaunchSpec {
             command: &cfg.command,
             app,
@@ -386,6 +410,7 @@ impl Child {
                 let what = self.cfg.ready.as_ref().map(Check::describe).unwrap_or_default();
                 events::log(format!("{}: already running ({what} answered); not launched", self.name));
                 self.status = Status::External;
+                self.ready_at = Some(SystemTime::now());
             } else if !shutting_down {
                 self.start();
             } else {
@@ -448,6 +473,7 @@ impl Child {
             if self.probe.as_ref().is_some_and(|p| p.0.passed()) {
                 events::log(format!("{}: ready after {} ms", self.name, self.started_at.elapsed().as_millis()));
                 self.readiness = Readiness::Passed;
+                self.became_ready();
                 changed = true;
             } else if Instant::now() >= self.ready_deadline {
                 events::log(format!("{}: not ready after {} ms", self.name, self.cfg.ready_timeout_ms()));
@@ -457,11 +483,32 @@ impl Child {
         } else if self.readiness == Readiness::TimedOut && self.probe.as_ref().is_some_and(|p| p.0.passed()) {
             events::log(format!("{}: ready after {} ms", self.name, self.started_at.elapsed().as_millis()));
             self.readiness = Readiness::Passed;
+            self.became_ready();
             changed = true;
+        }
+        if let Some(h) = &self.health {
+            let now = h.0.healthy();
+            if self.healthy != Some(now) {
+                if now {
+                    events::log(format!("{}: healthy again", self.name));
+                } else {
+                    let what = self.cfg.ready.as_ref().map(Check::describe).unwrap_or_default();
+                    events::log(format!("{}: unhealthy: {what} failed {} checks in a row", self.name, h.0.failures()));
+                }
+                self.healthy = Some(now);
+                changed = true;
+            }
         }
         if let Some(code) = self.exited(&job) {
             self.status = Status::Exited(code);
             self.probe = None;
+            self.health = None;
+            self.healthy = None;
+            self.exited_at = Some(SystemTime::now());
+            if code != 0 && !shutting_down {
+                self.crashed = true;
+                self.new_crash = true;
+            }
             events::log(format!("{}: exited with code {code}", self.name));
             if self.is_done() || !self.console {
                 // A finished task's console has done its job; close it.
@@ -491,6 +538,27 @@ impl Child {
         (changed || relayout, relayout)
     }
 
+    /// Readiness just passed: note when, and start the health watch if there is one.
+    fn became_ready(&mut self) {
+        self.ready_at = Some(SystemTime::now());
+        if let Some(h) = &self.cfg.health
+            && let Some(check) = self.cfg.ready.as_ref().and_then(|r| Check::from_config(r, None))
+        {
+            self.health = Some(ready::watch(check, Duration::from_millis(h.interval_ms), h.failures));
+            self.healthy = Some(true);
+        }
+    }
+
+    /// The reason a health watch failed, for status and the tile.
+    pub fn unhealthy_reason(&self) -> Option<String> {
+        if self.healthy != Some(false) {
+            return None;
+        }
+        let what = self.cfg.ready.as_ref().map(Check::describe).unwrap_or_default();
+        let n = self.health.as_ref().map_or(0, |h| h.0.failures());
+        Some(format!("{what} failed {n} checks in a row"))
+    }
+
     /// The exit code, once the app counts as exited.
     fn exited(&self, job: &Job) -> Option<u32> {
         let main = self.main.as_ref()?;
@@ -514,6 +582,8 @@ impl Child {
     pub fn stop_plan(&mut self, default_timeout_ms: u64, helper_exe: &Path) -> Option<StopPlan> {
         self.restart_at = None;
         self.precheck = None;
+        self.health = None;
+        self.healthy = None;
         if !self.is_active() {
             if matches!(self.status, Status::Waiting | Status::Checking) {
                 self.status = Status::Stopped;
@@ -546,6 +616,7 @@ impl Child {
     pub fn finish_stop(&mut self, outcome: StopOutcome) {
         self.last_stop = Some(outcome);
         self.probe = None;
+        self.exited_at = Some(SystemTime::now());
         let alive = self.job.as_ref().is_some_and(|j| j.active_count() > 0);
         self.status = if alive { Status::Stopping } else { Status::Stopped };
     }
@@ -1011,6 +1082,39 @@ fn conhost_path() -> String {
 /// Find the executable the way the app's command will run it: a path is relative to
 /// the app's working directory; a bare name is looked for there, then on the app's PATH.
 /// `.exe` is added to names without an extension.
+/// What would stop the app from launching: its exe can't be found, its `cwd` doesn't
+/// exist, or it captures output (`log`, `ready.log`) without being able to. Returns
+/// the exe that would run.
+fn preflight(cfg: &AppConfig, console: bool, has_shim: bool, captures: bool) -> std::result::Result<PathBuf, String> {
+    let token = crate::config::first_token(&cfg.command);
+    let exe = resolve_exe(&token, cfg.cwd.as_deref(), &effective_path(&cfg.env)).ok_or_else(|| {
+        format!("{token} not found in the app's folder or on PATH (run .cmd files and shell commands through cmd /c)")
+    })?;
+    if let Some(cwd) = &cfg.cwd
+        && !Path::new(cwd).is_dir()
+    {
+        return Err(format!("working directory {cwd} doesn't exist"));
+    }
+    if !console && captures {
+        return Err("log and ready.log only work for console apps".into());
+    }
+    if console && !has_shim && captures {
+        return Err(format!("{SHIM_EXE} is missing next to brady-bunch.exe; it's needed for log and ready.log"));
+    }
+    Ok(exe)
+}
+
+/// `brady-ctl check`: the problem that would stop this entry from launching, if any.
+/// `shim_dir` is where brady-shim.exe would be looked for.
+pub fn check_launch(cfg: &AppConfig, shim_dir: &Path) -> std::result::Result<(), String> {
+    let token = crate::config::first_token(&cfg.command);
+    let console = cfg.console.unwrap_or_else(|| {
+        resolve_exe(&token, cfg.cwd.as_deref(), &effective_path(&cfg.env)).is_some_and(|p| is_console_exe(&p))
+    });
+    let captures = cfg.log.is_some() || cfg.ready.as_ref().is_some_and(|r| r.log.is_some());
+    preflight(cfg, console, shim_dir.join(SHIM_EXE).is_file(), captures).map(|_| ())
+}
+
 pub fn resolve_exe(exe: &str, cwd: Option<&str>, path: &str) -> Option<PathBuf> {
     if exe.is_empty() {
         return None;

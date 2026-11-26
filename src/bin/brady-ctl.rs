@@ -1,9 +1,7 @@
 //! Command-line control for a running brady-bunch host. A console program, so shells
 //! wait for it and capture its output (brady-bunch.exe itself is a GUI program).
 //!
-//!     brady-ctl status [config|pid]
-//!     brady-ctl start|stop|restart <app> [config|pid]
-//!     brady-ctl tail <app> [config|pid] [--lines N]
+//! See `control::USAGE`, printed by `brady-ctl help`.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

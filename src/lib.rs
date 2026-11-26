@@ -6,4 +6,5 @@ pub mod config;
 pub mod control;
 pub mod ctrlc;
 pub mod events;
+pub mod layout;
 pub mod ready;

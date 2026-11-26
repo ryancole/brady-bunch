@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use windows::Win32::Networking::WinHttp::*;
 use windows::core::{HSTRING, PCWSTR, w};
@@ -104,6 +104,75 @@ pub fn spawn(mut check: Check, once: bool) -> ProbeGuard {
         }
     });
     ProbeGuard(probe)
+}
+
+/// The state of a health watch: the app's `ready` check, rerun every interval.
+pub struct Health {
+    healthy: AtomicBool,
+    /// Failed checks in a row.
+    failures: AtomicU32,
+    cancel: AtomicBool,
+}
+
+impl Health {
+    pub fn healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    pub fn failures(&self) -> u32 {
+        self.failures.load(Ordering::Acquire)
+    }
+}
+
+/// Stops the watch's thread when dropped.
+pub struct HealthGuard(pub Arc<Health>);
+
+impl Drop for HealthGuard {
+    fn drop(&mut self) {
+        self.0.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Rerun `check` every `interval`. The app turns unhealthy after `failures` failed
+/// checks in a row, and healthy again on the next one that passes.
+pub fn watch(mut check: Check, interval: Duration, failures: u32) -> HealthGuard {
+    let health = Arc::new(Health {
+        healthy: AtomicBool::new(true),
+        failures: AtomicU32::new(0),
+        cancel: AtomicBool::new(false),
+    });
+    let h = health.clone();
+    std::thread::spawn(move || {
+        let mut tail = String::new();
+        loop {
+            // Sleep in short steps so a cancelled watch stops promptly.
+            let wake = std::time::Instant::now() + interval;
+            while std::time::Instant::now() < wake {
+                if h.cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100).min(interval));
+            }
+            let ok = match &mut check {
+                Check::Tcp(addr) => tcp_ok(addr),
+                Check::Http(url) => http_ok(url),
+                Check::Log { path, offset, re } => log_matches(path, offset, re, &mut tail),
+            };
+            if h.cancel.load(Ordering::Acquire) {
+                return;
+            }
+            if ok {
+                h.failures.store(0, Ordering::Release);
+                h.healthy.store(true, Ordering::Release);
+            } else {
+                let n = h.failures.fetch_add(1, Ordering::AcqRel) + 1;
+                if n >= failures.max(1) {
+                    h.healthy.store(false, Ordering::Release);
+                }
+            }
+        }
+    });
+    HealthGuard(health)
 }
 
 fn tcp_ok(addr: &str) -> bool {
@@ -257,6 +326,26 @@ mod tests {
         assert!(tcp_ok(&format!("localhost:{port}")));
         drop(l);
         assert!(!tcp_ok(&format!("127.0.0.1:{port}")));
+    }
+
+    #[test]
+    fn health_turns_bad_after_failures_and_recovers() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+        drop(l);
+        let g = watch(Check::Tcp(addr.clone()), Duration::from_millis(20), 3);
+        let wait_for = |f: &dyn Fn() -> bool| {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while !f() && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            f()
+        };
+        assert!(wait_for(&|| !g.0.healthy()));
+        assert!(g.0.failures() >= 3);
+        let _l = TcpListener::bind(&addr).unwrap();
+        assert!(wait_for(&|| g.0.healthy() && g.0.failures() == 0));
     }
 
     #[test]
