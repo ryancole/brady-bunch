@@ -200,8 +200,13 @@ fn log_matches(path: &PathBuf, offset: &mut u64, re: &Regex, tail: &mut String) 
     if n == 0 {
         return false;
     }
-    *offset += n as u64;
-    tail.push_str(&String::from_utf8_lossy(&bytes));
+    // A character cut off at the end of the file is read again, whole, next time.
+    let used = match std::str::from_utf8(&bytes) {
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        _ => n,
+    };
+    *offset += used as u64;
+    tail.push_str(&String::from_utf8_lossy(&bytes[..used]));
     if re.is_match(tail) {
         return true;
     }
@@ -395,6 +400,22 @@ mod tests {
         write!(f, "Now listen").unwrap();
         assert!(!log_matches(&path, &mut offset, &re, &mut tail));
         writeln!(f, "ing on: https://localhost:8002").unwrap();
+        assert!(log_matches(&path, &mut offset, &re, &mut tail));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn log_check_matches_non_ascii_split_across_reads() {
+        let path = std::env::temp_dir().join(format!("bb-ready-utf8-{}.log", std::process::id()));
+        std::fs::write(&path, "").unwrap();
+        let mut offset = 0;
+        let re = Regex::new("➜  Local:").unwrap();
+        let mut tail = String::new();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        // ➜ is E2 9E 9C; the first read sees only its first two bytes.
+        f.write_all(b"  \xE2\x9E").unwrap();
+        assert!(!log_matches(&path, &mut offset, &re, &mut tail));
+        f.write_all(b"\x9C  Local:    https://localhost:8000/\r\n").unwrap();
         assert!(log_matches(&path, &mut offset, &re, &mut tail));
         let _ = std::fs::remove_file(&path);
     }

@@ -73,7 +73,7 @@ irm https://github.com/ryancole/brady-bunch/releases/latest/download/install.ps1
 
 This installs into `%LOCALAPPDATA%\Programs\brady-bunch` and adds that folder to the user PATH, so `brady-ctl` works in new shells. It checks the download against the release's SHA-256. Run it again to update; it refuses while brady-bunch is running from that folder, so run `brady-ctl down` first. `brady-ctl --version` prints the installed version. For a pinned version or an update check, run it as a script block: `& ([scriptblock]::Create((irm <url>))) -Version 0.6.0` or `... -Check`.
 
-In a config that relies on newer keys, set `min_version` so an older brady-bunch says to update.
+In a config that relies on newer keys, set `min_version` so an older brady-bunch says to update; the message includes the command that installs that version. A wrapper script can keep brady-bunch current for its config with `& ([scriptblock]::Create((irm <url>))) -Config C:\path\to\brady.toml` (add `-NoPath` or `-InstallDir` as usual): it does nothing, without going online, if the installed version meets the config's `min_version` (or the config has none and brady-bunch is installed), and otherwise installs the latest release, failing if even that is too old.
 
 ## Command line
 
@@ -91,6 +91,7 @@ brady-ctl wait <app> [config|pid] [--timeout secs]
 brady-ctl start|stop|restart <app> [config|pid]
 brady-ctl run <task> [config|pid] [--stop app,app] [--timeout secs]
 brady-ctl tail <app> [config|pid] [--lines N]
+brady-ctl events [config|pid] [--lines N] [--app name]
 brady-ctl --version
 ```
 
@@ -118,8 +119,9 @@ brady-ctl --version
 | `stop <app>` | Stops the app with the same steps as shutdown, and returns once it has stopped. It isn't restarted automatically. | The app's JSON, with `last_stop`. |
 | `restart <app>` | Stops the app if it's running, then starts it. Returns once it has been launched (or is waiting for dependencies), not once it's ready. | The app's JSON. |
 | `wait <app>` | Waits (`--timeout`, default 300s) until the app is ready. Use it after `start` or `restart`, which return at launch. Fails at once if the app, or something it depends on, fails or exits without a restart scheduled. | `ready: build, db, api (3.1s)` (the app and what it depends on). On failure, as `up`. |
-| `run <task>` | Reruns a `[[task]]` once startup has finished: stops the task's `stops` apps and any `--stop` apps (dependents first), runs the task in its tile, then starts those apps again behind it. Waits (`--timeout`) for the task and those apps, like `up`. | As `wait`. |
+| `run <task>` | Reruns a `[[task]]` once startup has finished: stops the task's `stops` apps and any `--stop` apps (dependents first), runs the task in its tile, then starts those apps again behind it. Waits (`--timeout`) for the task and those apps, like `up`. | What it did: `build: done (8.4s); restarted api, worker; ready (14.8s)`, times counted from when `run` started. On failure, the status JSON, and on stderr what failed and what's left waiting, e.g. `build: exited with code 1 (6.2s)` / `waiting for build to succeed: api, worker. ...`. |
 | `tail <app>` | Nothing | The last 40 lines (`--lines N`) of the app's console, as plain text. Works for a running console app and for one that exited, since its console stays open. |
+| `events [config\|pid]` | Nothing | The last 40 lines (`--lines N`) of the host's `event_log`, or only one app's lines with `--app name`. Reads the file, so given the config it also works after the host has exited (or never started); the path comes from the running host, else from the config's `event_log`. Exit `1` if the config has no `event_log`. |
 
 App names are matched case-insensitively. Exit codes: `0` done, `1` usage or config error, `2` no running host found, `3` the host refused (unknown app, shutting down, no console to read, a task is still running), `4` failed or timed out (`up`, `down`, `wait`, `run`).
 
@@ -140,6 +142,7 @@ If `run`'s task fails, it exits `4`, the task's tile shows its output, and the a
   "profiles": ["webdev"],
   "only": [],
   "skip": [],
+  "event_log": "C:\\src\\app\\brady-events.log",
   "shutting_down": false,
   "apps": [
     {
@@ -185,7 +188,7 @@ If `run`'s task fails, it exits `4`, the task's tile shows its output, and the a
 
 Times are UTC, ISO 8601 with milliseconds; `now` is the host's clock, to compare against. `launched_at` is when the current (or last) run was launched, so after `brady-ctl restart` it tells you whether you're looking at the new process. `ready_at` is when it became ready (for apps without a `ready` check, the launch time; `null` for tasks). `exited_at` is when it exited, failed to launch or was stopped, and is cleared at the next launch. `uptime_ms` is set while it's running. `healthy` is `null` without a `health` check (or before the app is ready), else `true`/`false`. `crashed` is `true` from an exit with a non-zero code or a failed launch (not a stop) until the app is launched again.
 
-`ready` is what dependents wait for. `pid` is the launched process (for console apps, `conhost.exe`) and is `null` when nothing is running. To see an app's output, use `brady-ctl tail <app>`, or `log` in the config.
+`ready` is what dependents wait for. `pid` is the launched process (for console apps, `conhost.exe`) and is `null` when nothing is running. `event_log` and each app's `log` are absolute paths (`null` when not set). To see an app's output, use `brady-ctl tail <app>`, or `log` in the config; for the host's events, `brady-ctl events`.
 
 ## Config reference (TOML)
 
@@ -197,13 +200,13 @@ Top level:
 | `shutdown_timeout_ms` | integer | `5000` | How long each shutdown step waits before escalating. |
 | `columns` | integer | ceil(√n) | Fixed number of grid columns. |
 | `maximized` | bool | `false` | Start the host maximized. |
-| `event_log` | path | none | File the host writes its events to: launches, exits, readiness, restarts, and each shutdown step with timings. Replaced each time the host starts. Relative to the config file. |
+| `event_log` | path | none | File the host writes its events to: launches, exits, readiness, restarts, and each shutdown step with timings. Replaced each time the host starts. Relative to the config file. Each line starts with the local time and its UTC offset (see Logs). `brady-ctl events` prints it. |
 | `keep_logs` | integer | `1` | How many previous copies of `event_log` and of each app's `log` to keep. At start, `events.log` becomes `events.1.log`, `events.1.log` becomes `events.2.log`, and so on. `0` keeps none. |
 | `flash_on_crash` | bool | `true` | Flash the host's taskbar button when an app crashes (see Tiles). |
 | `remember_layout` | bool | `true` | Restore the window's position, size, maximized state and zoomed tile from the last run of this config. Stored in `%LOCALAPPDATA%\brady-bunch\layouts`, not next to the config. When there's a saved layout, it wins over `maximized`. |
 | `min_version` | string | none | The oldest brady-bunch that can run this config, e.g. `"0.6.0"`. Checked before anything else, so an older brady-bunch says `This config needs brady-bunch 0.6.0 or newer; this is 0.5.1` instead of rejecting a newer key. Versions before 0.6.0 don't know this key and report it as unknown. |
 | `[profiles]` | table | none | Named selections for `--profile`: `webdev = { skip = ["worker", "functions"] }`, `api-only = { only = ["api"] }`. `only` and `skip` work like the command-line flags, and can name tasks. |
-| `[defaults]` | table | none | Values for every `[[app]]` that doesn't set them. Allowed keys: `cwd`, `console`, `shutdown`, `shutdown_timeout_ms`, `restart`, `restart_delay_ms`, `env`, `exit_with`, `quick_edit`. `env` tables are merged, with the app's own values winning. Doesn't apply to `[[task]]`. |
+| `[defaults]` | table | none | Values for every `[[app]]` that doesn't set them. Allowed keys: `cwd`, `console`, `shutdown`, `shutdown_timeout_ms`, `restart`, `restart_delay_ms`, `env`, `path_prepend`, `path_append`, `encoding`, `exit_with`, `quick_edit`. `env` tables are merged, with the app's own values winning; `path_prepend`/`path_append` lists are joined, the app's own folders first. Doesn't apply to `[[task]]`. |
 | `[[task]]` | table array | none | Setup steps (below). |
 | `[[app]]` | table array | required, at least one | One entry per program. Tiles are in config order. |
 
@@ -216,11 +219,14 @@ Per `[[app]]`:
 | `cwd` | string | host's cwd | Working directory for the app. A relative path is relative to the config file's folder. |
 | `console` | bool | auto-detected | Treat as a console app (`true`) or GUI app (`false`). Auto-detection reads the exe's PE header; `.bat`/`.cmd` count as console. |
 | `env` | table of strings | none | Extra environment variables, e.g. `env = { ASPNETCORE_ENVIRONMENT = "Development" }`. Added to the host's environment, replacing variables with the same name (case-insensitive). `%VAR%` in values is expanded from the host's environment, so `PATH = 'C:\tools;%PATH%'` prepends to PATH. |
+| `path_prepend` | array of paths | none | Folders to put in front of PATH, e.g. `['node_modules\.bin', 'C:\Program Files\Tool']`. Applied after `env` (to its `PATH` if it sets one, else the host's). Folders that don't exist when the app launches are skipped, so you can list every place a tool might be installed. Relative to the config file; `%VAR%` is expanded. Used for finding the exe too, like `env.PATH`. |
+| `path_append` | array of paths | none | The same, added to the end of PATH. |
 | `depends_on` | array of names | none | Apps that must be ready before this one is launched (see Startup order). |
 | `ready` | table | none | When the app counts as ready: exactly one of `tcp`, `http` or `log`, plus optional `timeout_ms` (see Startup order). |
-| `health` | table | none | Keep running the `ready` check (`tcp` or `http` only) after the app is ready: `health = { interval_ms = 10000, failures = 3 }` (those are the defaults; `health = {}` uses them). After `failures` failed checks in a row the app shows `unhealthy`; it's back to normal when one passes. Changes are logged in `event_log`. Nothing is restarted and dependents aren't affected. |
+| `health` | table | none | Keep checking the app after it's ready: `health = { interval_ms = 10000, failures = 3 }` (those are the defaults; `health = {}` uses them). The check is the table's own `tcp` or `http` (same forms as in `ready`), e.g. `health = { http = "https://localhost:8000" }` for a dev server whose `ready` has to be `log`; without one, it reuses the `ready` check, which must then be `tcp` or `http`. After `failures` failed checks in a row the app shows `unhealthy`; it's back to normal when one passes. Changes are logged in `event_log`. Nothing is restarted and dependents aren't affected. |
 | `skip_if_ready` | bool | `false` | Before launching, run the `ready` check once (`tcp` or `http` only). If it passes, the app is already running outside brady-bunch: it isn't launched, and shows `already running`. |
-| `log` | path | none | Copy the app's console output to this file, with colour codes removed, while it still shows in the tile. Emptied when the host starts; restarts append, with a `---- <time> start` line before each run and `---- <time> exited with code N` after. Relative to the config file. Console apps only. See the caveat under Logs. |
+| `log` | path | none | Copy the app's console output to this file, as UTF-8 with colour codes removed, while it still shows in the tile. Emptied when the host starts; restarts append, with a `---- <time> start` line before each run and `---- <time> exited with code N` after. Relative to the config file. Console apps only. See the caveat under Logs. |
+| `encoding` | `"utf-8"`, `"oem"` or `"ansi"` | `"utf-8"` | What the app writes when its output is copied (`log` or `ready.log`); ignored otherwise. See Logs. |
 | `url` | string | none | Shown as a link in the tile header; clicking it opens the default browser. |
 | `quick_edit` | bool | `false` | Leave the console's QuickEdit mode as the user's console settings have it. By default it's turned off (see Tiles). |
 | `exit_with` | `"all"` or `"main"` | `"all"` | What counts as the app exiting. `all`: every process it started has exited. `main`: the launched process has exited (for console apps, the program running inside the console), and anything it left behind is killed. Use `main` for `dotnet run`/`dotnet watch` and other tools that leave background servers running. |
@@ -229,15 +235,15 @@ Per `[[app]]`:
 | `restart` | `"never"`, `"on-failure"` or `"always"` | `"never"` | Relaunch the app after it exits on its own. `on-failure` covers a non-zero exit code or a failed launch. |
 | `restart_delay_ms` | integer | `1000` | Wait before an automatic restart. It doubles, up to 30s, each time the app exits within 10s of starting, and resets once it runs longer. |
 
-Per `[[task]]`: `command` (required), `name`, `cwd`, `env`, `console`, `log`, `quick_edit`, `shutdown`, `shutdown_timeout_ms`, and `exit_with`, which defaults to `"main"` for tasks so build servers left behind don't hold them open. Tasks also take `stops`: the apps `brady-ctl run <task>` stops before rerunning it and starts again after, e.g. `stops = ["api", "worker"]` for a build whose output those apps lock. Names left out by `--profile`/`--only`/`--skip` are ignored.
+Per `[[task]]`: `command` (required), `name`, `cwd`, `env`, `path_prepend`, `path_append`, `console`, `log`, `encoding`, `quick_edit`, `shutdown`, `shutdown_timeout_ms`, and `exit_with`, which defaults to `"main"` for tasks so build servers left behind don't hold them open. Tasks also take `stops`: the apps `brady-ctl run <task>` stops before rerunning it and starts again after, e.g. `stops = ["api", "worker"]` for a build whose output those apps lock. Names left out by `--profile`/`--only`/`--skip` are ignored.
 
 Config rules:
 
 - Unknown keys are errors. So are unknown names in `depends_on`, a dependency cycle, and a `ready` table without exactly one check.
 - Use TOML literal strings (single quotes) for Windows paths and commands, so backslashes need no escaping: `command = '"C:\Program Files\Tool\tool.exe" --flag'`. A literal string can't contain a single quote; use a double-quoted string (escaping backslashes) or `'''...'''` for those.
-- **`%VAR%` expansion:** `command`, `cwd`, `log`, `url` and `ready` values see the app's own `env` first, then the host's environment; `env` values see the host's. Names that aren't set are left as written, like cmd.exe does.
+- **`%VAR%` expansion:** `command`, `cwd`, `log`, `url`, `path_prepend`, `path_append`, `ready` and `health` values see the app's own `env` first, then the host's environment; `env` values see the host's. Names that aren't set are left as written, like cmd.exe does.
 - Quote an exe path containing spaces inside `command`, as shown above. The command line reaches the program exactly as written, including nested quotes such as `cmd /c ""%TOOL%" --flag"`.
-- **Finding the exe:** a path is relative to the app's `cwd`. A bare name is looked for in the app's `cwd`, then on PATH as the app will see it (so `env = { PATH = ... }` counts). `.exe` is added if the name has no extension. If it isn't found, the tile shows `failed: <name> not found...` and nothing is launched.
+- **Finding the exe:** a path is relative to the app's `cwd`. A bare name is looked for in the app's `cwd`, then on PATH as the app will see it (so `env = { PATH = ... }`, `path_prepend` and `path_append` count). `.exe` is added if the name has no extension. If it isn't found, the tile shows `failed: <name> not found...` and nothing is launched.
 - Only real `.exe` files and `.bat`/`.cmd` files launch directly. Run wrappers without an extension (`npm`, `npx`, `yarn`, `pnpm`), shell builtins and pipelines through `cmd /c`: `command = 'cmd /c "npm run build && npm start"'`.
 - After Ctrl+C, a batch wrapper may stop at `Terminate batch job (Y/N)?`. That's handled: once only `cmd.exe` and console plumbing are left in the app, brady-bunch closes the console right away instead of waiting out the timeout. The app still counts as stopped by `ctrl-c`.
 
@@ -269,16 +275,17 @@ After startup, `brady-ctl run <task>` reruns a task while the apps are up, for e
 
 - **`brady-ctl tail <app>`** prints what's in the app's console. Use it first; it needs no config.
 - **`log = 'path'`** keeps a full copy of the app's output in a file. To do that, the app's stdout and stderr become a pipe that brady-shim copies to both the console and the file. The app then no longer sees a console on those streams: some programs drop colours and progress bars (npm, rspack), and some buffer their output (Python without `-u`, some C programs). .NET, Java and Node servers are fine. Input still comes from the console.
+- **Encoding of copied output:** brady-shim decodes what the app writes and shows it as text, and writes the file as UTF-8, so `ready.log` regexes can match non-ASCII text. By default (`encoding = "utf-8"`) it reads UTF-8 and sets the console's output code page to UTF-8 (65001), so programs that write in the console's code page (.NET, cmd) write UTF-8 too; bytes that aren't valid UTF-8 are read in the ANSI code page (Python, Java and C programs writing to a pipe often use it). Set `encoding = "oem"` or `"ansi"` for a program that always writes in that code page. Apps whose output isn't copied write straight to the console and aren't affected.
 - **Previous runs:** each host start moves the last run's `event_log` and `log` files to `name.1.log` (and older ones up to `keep_logs`), so a crashed or odd session's record survives a relaunch.
-- **`event_log`** is the host's own record. A typical shutdown:
+- **`event_log`** is the host's own record. `brady-ctl events <config> --app api` prints its end, for one app or all. A typical shutdown:
 
   ```
-  2026-11-25 10:15:39.315 api: stopping
-  2026-11-25 10:15:39.381 api: sent ctrl-c
-  2026-11-25 10:15:41.215 api: stopped by ctrl-c after 1900 ms
+  2026-11-25 10:15:39.315-06:00 api: stopping
+  2026-11-25 10:15:39.381-06:00 api: sent ctrl-c
+  2026-11-25 10:15:41.215-06:00 api: stopped by ctrl-c after 1900 ms
   ```
 
-  `stopped by kill` means it ignored the graceful steps.
+  `stopped by kill` means it ignored the graceful steps. Times are local, with their offset from UTC (here 6 hours behind), so they match `brady-ctl status` times, which are UTC: `10:15:39.315-06:00` is `16:15:39.315Z`. The `----` lines in `log` files use the same format.
 
 ## .NET apps
 

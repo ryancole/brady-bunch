@@ -48,12 +48,51 @@ pub fn numbered(path: &Path, n: u32) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Local time with its UTC offset: `2026-11-25 19:02:36.893-06:00`.
 pub fn timestamp() -> String {
-    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime};
+    unsafe {
+        // One reading of the clock, converted, so the offset can't straddle a change.
+        let utc = windows::Win32::System::SystemInformation::GetSystemTime();
+        let mut local = SYSTEMTIME::default();
+        if SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_err() {
+            local = utc;
+        }
+        let ticks = |t: &SYSTEMTIME| {
+            let mut f = FILETIME::default();
+            let _ = SystemTimeToFileTime(t, &mut f);
+            ((f.dwHighDateTime as i64) << 32) | f.dwLowDateTime as i64
+        };
+        // FILETIME ticks are 100 ns.
+        let offset_min = ((ticks(&local) - ticks(&utc)) / 600_000_000) as i32;
+        let t = local;
+        format_local([t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds], offset_min)
+    }
+}
+
+/// `[year, month, day, hour, minute, second, ms]` and minutes east of UTC.
+fn format_local(t: [u16; 7], offset_min: i32) -> String {
+    let sign = if offset_min < 0 { '-' } else { '+' };
+    let off = offset_min.unsigned_abs();
     format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}{sign}{:02}:{:02}",
+        t[0],
+        t[1],
+        t[2],
+        t[3],
+        t[4],
+        t[5],
+        t[6],
+        off / 60,
+        off % 60
     )
+}
+
+/// The text of an event log line after its timestamp (`api: launched (pid 12)`).
+/// Lines are `<date> <time> <text>`.
+pub fn line_text(line: &str) -> &str {
+    line.splitn(3, ' ').nth(2).unwrap_or("")
 }
 
 /// ISO 8601 in UTC with milliseconds: `2026-11-25T18:22:15.280Z`.
@@ -92,6 +131,17 @@ mod tests {
         assert_eq!(iso_utc(t), "2026-11-30T00:22:15.280Z");
         let leap = UNIX_EPOCH + Duration::from_secs(951_782_400); // 2000-02-29
         assert_eq!(iso_utc(leap), "2000-02-29T00:00:00.000Z");
+    }
+
+    #[test]
+    fn local_timestamps_carry_their_offset() {
+        assert_eq!(format_local([2026, 11, 25, 19, 2, 36, 893], -360), "2026-11-25 19:02:36.893-06:00");
+        assert_eq!(format_local([2026, 1, 5, 4, 0, 0, 7], 330), "2026-01-05 04:00:00.007+05:30");
+        assert_eq!(format_local([2026, 1, 5, 4, 0, 0, 7], 0), "2026-01-05 04:00:00.007+00:00");
+        let now = timestamp();
+        assert_eq!(now.len(), "2026-11-25 19:02:36.893-06:00".len(), "{now}");
+        assert_eq!(line_text(&format!("{now} api: launched (pid 12)")), "api: launched (pid 12)");
+        assert_eq!(line_text("2026-11-25 10:15:39.315 api: stopping"), "api: stopping");
     }
 
     #[test]

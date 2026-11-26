@@ -68,6 +68,8 @@ struct Ui {
     /// `brady-ctl down` clients, answered with the final status as the host exits.
     quit_replies: Vec<Reply>,
     run: Option<Run>,
+    /// `event_log`, absolute.
+    event_log: Option<PathBuf>,
     columns: Option<u32>,
     timeout_ms: u64,
     helper_exe: PathBuf,
@@ -256,6 +258,7 @@ unsafe fn run(cfg: config::Loaded, config_path: PathBuf) -> Result<()> {
                 remember_layout: cfg.remember_layout,
                 quit_replies: Vec::new(),
                 run: None,
+                event_log: cfg.event_log.clone(),
                 columns: cfg.columns,
                 timeout_ms: cfg.shutdown_timeout_ms,
                 helper_exe: helper_exe.clone(),
@@ -1050,6 +1053,7 @@ impl Ui {
             "profiles": self.selection.profiles,
             "only": self.selection.only,
             "skip": self.selection.skip,
+            "event_log": self.event_log.as_ref().map(|p| p.to_string_lossy()),
             "shutting_down": self.shutting_down,
             "apps": (0..self.children.len()).map(|i| self.app_json(i)).collect::<Vec<_>>(),
         })

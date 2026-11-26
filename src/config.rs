@@ -46,6 +46,30 @@ pub enum ExitWith {
     Main,
 }
 
+/// What a program's copied output (`log`, `ready.log`) is written in.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Encoding {
+    #[default]
+    #[serde(rename = "utf-8")]
+    Utf8,
+    /// The OEM code page, e.g. 437: what the console uses by default.
+    #[serde(rename = "oem")]
+    Oem,
+    /// The ANSI code page, e.g. 1252.
+    #[serde(rename = "ansi")]
+    Ansi,
+}
+
+impl Encoding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Encoding::Utf8 => "utf-8",
+            Encoding::Oem => "oem",
+            Encoding::Ansi => "ansi",
+        }
+    }
+}
+
 /// `tcp = 10000` (localhost) or `tcp = "host:port"`.
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(untagged)]
@@ -70,10 +94,13 @@ pub struct ReadyConfig {
 
 pub const DEFAULT_READY_TIMEOUT_MS: u64 = 60_000;
 
-/// Keep running the `ready` check after the app is ready.
+/// Keep checking the app after it's ready: its own `tcp`/`http` check, or else the
+/// `ready` check.
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct HealthConfig {
+    pub tcp: Option<TcpTarget>,
+    pub http: Option<String>,
     /// Time between checks.
     #[serde(default = "default_health_interval")]
     pub interval_ms: u64,
@@ -155,6 +182,9 @@ pub struct Defaults {
     env: Option<BTreeMap<String, String>>,
     exit_with: Option<ExitWith>,
     quick_edit: Option<bool>,
+    path_prepend: Option<Vec<String>>,
+    path_append: Option<Vec<String>>,
+    encoding: Option<Encoding>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -177,6 +207,15 @@ pub struct AppConfig {
     /// Extra environment variables, added to (or overriding) the host's environment.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Folders put before / after PATH (after `env`), skipping ones that don't exist.
+    /// Absolute after `load`.
+    #[serde(default)]
+    pub path_prepend: Vec<String>,
+    #[serde(default)]
+    pub path_append: Vec<String>,
+    /// What the program's copied output is written in.
+    #[serde(default)]
+    pub encoding: Encoding,
     #[serde(default)]
     pub exit_with: ExitWith,
     /// Apps that must be ready before this one starts.
@@ -216,6 +255,12 @@ pub struct TaskConfig {
     pub console: Option<bool>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub path_prepend: Vec<String>,
+    #[serde(default)]
+    pub path_append: Vec<String>,
+    #[serde(default)]
+    pub encoding: Encoding,
     #[serde(default = "task_exit_with")]
     pub exit_with: ExitWith,
     pub log: Option<String>,
@@ -241,6 +286,9 @@ impl From<TaskConfig> for AppConfig {
             cwd: t.cwd,
             console: t.console,
             env: t.env,
+            path_prepend: t.path_prepend,
+            path_append: t.path_append,
+            encoding: t.encoding,
             exit_with: t.exit_with,
             log: t.log,
             quick_edit: t.quick_edit,
@@ -260,6 +308,16 @@ impl AppConfig {
 
     pub fn ready_timeout_ms(&self) -> u64 {
         self.ready.as_ref().and_then(|r| r.timeout_ms).unwrap_or(DEFAULT_READY_TIMEOUT_MS)
+    }
+
+    /// The check `health` runs: its own `tcp`/`http`, else the `ready` check. None
+    /// without `health`.
+    pub fn health_check(&self) -> Option<ReadyConfig> {
+        let h = self.health.as_ref()?;
+        if h.tcp.is_some() || h.http.is_some() {
+            return Some(ReadyConfig { tcp: h.tcp.clone(), http: h.http.clone(), log: None, timeout_ms: None });
+        }
+        self.ready.clone()
     }
 }
 
@@ -337,11 +395,25 @@ pub fn resolve_path(arg: Option<PathBuf>) -> PathBuf {
 pub fn load(path: &Path, sel: &Selection) -> Result<Loaded, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("Could not read config {}: {e}", path.display()))?;
-    let dir = std::path::absolute(path)
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_default();
-    parse(&text, &dir, sel).map_err(|e| format!("Invalid config {}:\n\n{e}", path.display()))
+    parse(&text, &config_dir(path), sel).map_err(|e| format!("Invalid config {}:\n\n{e}", path.display()))
+}
+
+/// The folder relative paths in the config are relative to.
+fn config_dir(path: &Path) -> PathBuf {
+    std::path::absolute(path).ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default()
+}
+
+/// The config's `event_log`, as an absolute path, read without checking the rest of
+/// the config (for `brady-ctl events` after the host has gone).
+pub fn event_log_path(path: &Path) -> Result<Option<PathBuf>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Could not read config {}: {e}", path.display()))?;
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|e| format!("Invalid config {}:\n\n{e}", path.display()))?;
+    Ok(table
+        .get("event_log")
+        .and_then(toml::Value::as_str)
+        .map(|p| absolute_in(&config_dir(path), &expand(p, &|k| env_var(k)))))
 }
 
 fn parse(text: &str, config_dir: &Path, sel: &Selection) -> Result<Loaded, String> {
@@ -418,9 +490,26 @@ fn check_min_version(v: Option<&toml::Value>) -> Result<(), String> {
     let have = parse_version(VERSION).unwrap_or_default();
     if have < wanted {
         let w = v.as_str().unwrap_or_default();
-        return Err(format!("This config needs brady-bunch {w} or newer; this is {VERSION}. Update brady-bunch to run it."));
+        return Err(format!(
+            "This config needs brady-bunch {w} or newer; this is {VERSION}. Update brady-bunch to run it:\n\n{}",
+            install_command(w)
+        ));
     }
     Ok(())
+}
+
+/// The PowerShell command that installs `version` where this brady-bunch is.
+fn install_command(version: &str) -> String {
+    const URL: &str = "https://github.com/ryancole/brady-bunch/releases/latest/download/install.ps1";
+    let mut cmd = format!("& ([scriptblock]::Create((irm {URL}))) -Version {version}");
+    let here = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    let default = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(r"Programs\brady-bunch"));
+    if let Some(here) = here
+        && default.is_none_or(|d| !d.to_string_lossy().eq_ignore_ascii_case(&here.to_string_lossy()))
+    {
+        cmd.push_str(&format!(" -InstallDir '{}'", here.display()));
+    }
+    cmd
 }
 
 /// `1.2.3` (or `1.2`, `1`) as comparable numbers.
@@ -468,6 +557,10 @@ fn with_profiles(
 fn apply_defaults(app: &mut toml::Table, defaults: &toml::Table) {
     for (k, v) in defaults {
         match (app.get_mut(k), v) {
+            // The app's own folders come first, then the defaults'.
+            (Some(toml::Value::Array(mine)), toml::Value::Array(theirs)) if k.starts_with("path_") => {
+                mine.extend(theirs.iter().cloned());
+            }
             (Some(toml::Value::Table(mine)), toml::Value::Table(theirs)) if k == "env" => {
                 for (ek, ev) in theirs {
                     if !mine.keys().any(|m| m.eq_ignore_ascii_case(ek)) {
@@ -498,10 +591,19 @@ fn resolve_entry(e: &mut AppConfig, config_dir: &Path) {
     e.cwd = e.cwd.as_ref().map(|c| absolute_in(config_dir, &expand(c, &app_env)).to_string_lossy().into_owned());
     e.log = e.log.as_ref().map(|l| absolute_in(config_dir, &expand(l, &app_env)).to_string_lossy().into_owned());
     e.url = e.url.as_ref().map(|u| expand(u, &app_env));
-    if let Some(r) = &mut e.ready {
-        r.http = r.http.as_ref().map(|u| expand(u, &app_env));
-        if let Some(TcpTarget::Addr(a)) = &r.tcp {
-            r.tcp = Some(TcpTarget::Addr(expand(a, &app_env)));
+    let dirs = |list: &[String]| -> Vec<String> {
+        list.iter().map(|d| absolute_in(config_dir, &expand(d, &app_env)).to_string_lossy().into_owned()).collect()
+    };
+    e.path_prepend = dirs(&e.path_prepend);
+    e.path_append = dirs(&e.path_append);
+    let checks = [
+        e.ready.as_mut().map(|r| (&mut r.http, &mut r.tcp)),
+        e.health.as_mut().map(|h| (&mut h.http, &mut h.tcp)),
+    ];
+    for (http, tcp) in checks.into_iter().flatten() {
+        *http = http.as_ref().map(|u| expand(u, &app_env));
+        if let Some(TcpTarget::Addr(a)) = tcp {
+            *tcp = Some(TcpTarget::Addr(expand(a, &app_env)));
         }
     }
     e.env = env;
@@ -611,8 +713,21 @@ fn dependencies(entries: &[AppConfig]) -> Result<Vec<Vec<usize>>, String> {
         if e.skip_if_ready && !e.ready.as_ref().is_some_and(|r| r.tcp.is_some() || r.http.is_some()) {
             return Err(format!("{}{}: skip_if_ready needs a `ready` check with tcp or http.", at(e), e.name()));
         }
-        if e.health.is_some() && !e.ready.as_ref().is_some_and(|r| r.tcp.is_some() || r.http.is_some()) {
-            return Err(format!("{}{}: health needs a `ready` check with tcp or http.", at(e), e.name()));
+        if let Some(h) = &e.health {
+            if h.tcp.is_some() && h.http.is_some() {
+                return Err(format!("{}{}: `health` takes one of tcp or http, not both.", at(e), e.name()));
+            }
+            if h.tcp.is_some() || h.http.is_some() {
+                let r = ReadyConfig { tcp: h.tcp.clone(), http: h.http.clone(), log: None, timeout_ms: None };
+                check_ready(e.name(), &r).map_err(|err| format!("{}{}", at(e), err.replace("ready.", "health.")))?;
+            } else if !e.ready.as_ref().is_some_and(|r| r.tcp.is_some() || r.http.is_some()) {
+                return Err(format!(
+                    "{}{}: health needs its own tcp or http check (`health = {{ http = \"...\" }}`), \
+                     or a `ready` check with tcp or http to reuse.",
+                    at(e),
+                    e.name()
+                ));
+            }
         }
         all.push(deps);
     }
@@ -879,12 +994,75 @@ mod tests {
         let err = load_str(text).unwrap_err();
         assert!(err.starts_with("line 7: b depends_on"), "{err}");
         let health = "[[app]]\ncommand = \"a\"\nhealth = {}\n";
-        assert!(load_str(health).unwrap_err().contains("health needs a `ready` check"));
+        assert!(load_str(health).unwrap_err().contains("health needs its own tcp or http check"));
         let ok = "[[app]]\ncommand = \"a\"\nready = { tcp = 1 }\nhealth = { interval_ms = 500 }\n";
         let h = load_str(ok).unwrap().entries[0].health.clone().unwrap();
         assert_eq!((h.interval_ms, h.failures), (500, 3));
         let l = load_str("keep_logs = 3\nflash_on_crash = false\n[[app]]\ncommand = \"a\"\n").unwrap();
         assert_eq!((l.keep_logs, l.flash_on_crash, l.remember_layout), (3, false, true));
+    }
+
+    #[test]
+    fn health_can_have_its_own_check() {
+        let text = "[[app]]\ncommand = 'a'\nready = { log = 'compiled successfully' }\n\
+                    health = { http = 'https://localhost:%BB_HEALTH_PORT%', interval_ms = 500 }\n";
+        // SAFETY: tests in this module don't otherwise touch this variable.
+        unsafe { std::env::set_var("BB_HEALTH_PORT", "8000") };
+        let l = load_str(text).unwrap();
+        let check = l.entries[0].health_check().unwrap();
+        assert_eq!(check.http.as_deref(), Some("https://localhost:8000"));
+        assert!(check.log.is_none());
+        // Without its own check, health reuses a tcp/http ready check.
+        let l = load_str("[[app]]\ncommand = 'a'\nready = { tcp = 5 }\nhealth = {}\n").unwrap();
+        assert_eq!(l.entries[0].health_check().unwrap().tcp, Some(TcpTarget::Port(5)));
+        let both = "[[app]]\ncommand = 'a'\nhealth = { tcp = 1, http = 'http://x' }\n";
+        assert!(load_str(both).unwrap_err().contains("not both"));
+        let bad = "[[app]]\ncommand = 'a'\nhealth = { http = 'localhost' }\n";
+        assert!(load_str(bad).unwrap_err().contains("health.http must start with"));
+        let log = "[[app]]\ncommand = 'a'\nhealth = { log = 'x' }\n";
+        assert!(load_str(log).is_err(), "health has no log check");
+    }
+
+    #[test]
+    fn path_lists_resolve_and_merge_with_defaults() {
+        let l = load_str(
+            r#"
+            [defaults]
+            path_prepend = ['C:\shared']
+            path_append = ['tools']
+            encoding = "oem"
+            [[app]]
+            command = "a"
+            path_prepend = ['node_modules\.bin', 'D:\abs']
+            [[app]]
+            command = "b"
+            encoding = "utf-8"
+            [[task]]
+            command = "t"
+            path_prepend = ['bin']
+        "#,
+        )
+        .unwrap();
+        let (t, a, b) = (&l.entries[0], &l.entries[1], &l.entries[2]);
+        assert_eq!(a.path_prepend, [r"C:\repo\node_modules\.bin", r"D:\abs", r"C:\shared"]);
+        assert_eq!(a.path_append, [r"C:\repo\tools"]);
+        assert_eq!(b.path_prepend, [r"C:\shared"]);
+        assert_eq!((a.encoding, b.encoding, t.encoding), (Encoding::Oem, Encoding::Utf8, Encoding::Utf8));
+        assert_eq!(t.path_prepend, [r"C:\repo\bin"]);
+        assert!(load_str("[[app]]\ncommand = 'a'\nencoding = 'latin1'\n").is_err());
+    }
+
+    #[test]
+    fn event_log_path_needs_only_the_key() {
+        let dir = std::env::temp_dir().join(format!("bb-evpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.toml");
+        // Not a loadable config (no apps, a future version), but the path is still found.
+        std::fs::write(&file, "min_version = '999.0'\nevent_log = 'logs\\ev.log'\n").unwrap();
+        assert_eq!(event_log_path(&file).unwrap(), Some(dir.join(r"logs\ev.log")));
+        std::fs::write(&file, "title = 'x'\n").unwrap();
+        assert_eq!(event_log_path(&file).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -955,6 +1133,7 @@ mod tests {
         let text = format!("min_version = \"999.0\"\nbrand_new_key = 1\n{STACK}");
         let err = load_str(&text).unwrap_err();
         assert!(err.contains("needs brady-bunch 999.0 or newer"), "{err}");
+        assert!(err.contains("install.ps1))) -Version 999.0"), "{err}");
         let text = format!("min_version = \"{VERSION}\"\n{STACK}");
         assert!(load_str(&text).is_ok());
         assert!(load_str(&format!("min_version = \"soon\"\n{STACK}")).is_err());

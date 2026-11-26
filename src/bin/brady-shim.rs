@@ -7,14 +7,17 @@
 //! - **QuickEdit off**, so a click on the tile can't start a selection that blocks
 //!   the app's next console write.
 //! - **Output copy** (`log`): the app's stdout/stderr go through a pipe that is echoed
-//!   to the console and appended to a file with escape sequences stripped.
+//!   to the console and appended to a file with escape sequences stripped. The bytes
+//!   are decoded (UTF-8 by default) and written to the console as UTF-16, so the
+//!   console's code page doesn't garble them, and the file always gets UTF-8.
 //! - **Keeps the console open** after the app exits, so its last output stays readable,
 //!   by handing the console to `brady-shim.exe --hold <code>` and exiting with the
 //!   app's exit code.
 //!
 //! Inputs (removed from the environment before the app starts):
 //! `BRADY_SHIM_COMMAND` command line, `BRADY_SHIM_APP` resolved executable,
-//! `BRADY_SHIM_LOG` output copy, `BRADY_SHIM_QUICK_EDIT=1` leave QuickEdit alone,
+//! `BRADY_SHIM_LOG` output copy, `BRADY_SHIM_ENCODING` what the copied output is in
+//! (`utf-8`, `oem` or `ansi`), `BRADY_SHIM_QUICK_EDIT=1` leave QuickEdit alone,
 //! `BRADY_SHIM_HOLD=0` don't keep the console open.
 
 use std::ffi::c_void;
@@ -22,6 +25,9 @@ use std::fs::File;
 use std::io::Write;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+use windows::Win32::Globalization::{
+    CP_UTF8, GetACP, GetOEMCP, IsDBCSLeadByteEx, MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar,
+};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::*;
 use windows::Win32::System::Pipes::CreatePipe;
@@ -37,6 +43,7 @@ const ENV_APP: &str = "BRADY_SHIM_APP";
 const ENV_LOG: &str = "BRADY_SHIM_LOG";
 const ENV_QUICK_EDIT: &str = "BRADY_SHIM_QUICK_EDIT";
 const ENV_HOLD: &str = "BRADY_SHIM_HOLD";
+const ENV_ENCODING: &str = "BRADY_SHIM_ENCODING";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -71,6 +78,11 @@ fn run() -> u32 {
     let log_path = take_env(ENV_LOG);
     let quick_edit = take_env(ENV_QUICK_EDIT).as_deref() == Some("1");
     let keep_open = take_env(ENV_HOLD).as_deref() != Some("0");
+    let code_page = match take_env(ENV_ENCODING).as_deref() {
+        Some("oem") => unsafe { GetOEMCP() },
+        Some("ansi") => unsafe { GetACP() },
+        _ => CP_UTF8,
+    };
 
     if !quick_edit {
         set_quick_edit(false);
@@ -78,9 +90,16 @@ fn run() -> u32 {
     let mut log = log_path.as_ref().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
     if let Some(f) = &mut log {
         let _ = writeln!(f, "---- {} start: {command}", timestamp());
+        // Programs that write in the console's code page (.NET, cmd) then write UTF-8,
+        // which is what the copy decodes.
+        if code_page == CP_UTF8 {
+            unsafe {
+                let _ = SetConsoleOutputCP(CP_UTF8);
+            }
+        }
     }
 
-    let code = match unsafe { launch(&command, app.as_deref(), log.as_ref()) } {
+    let code = match unsafe { launch(&command, app.as_deref(), log.as_ref(), code_page) } {
         Ok(code) => code,
         Err(e) => {
             let msg = format!("brady-bunch: could not start {command}\r\n{}\r\n", e.message());
@@ -106,7 +125,7 @@ fn run() -> u32 {
 }
 
 /// Run the app and wait for it. Returns its exit code.
-unsafe fn launch(command: &str, app: Option<&str>, log: Option<&File>) -> windows::core::Result<u32> {
+unsafe fn launch(command: &str, app: Option<&str>, log: Option<&File>, code_page: u32) -> windows::core::Result<u32> {
     unsafe {
         let mut si = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, ..Default::default() };
         let mut pipe = None;
@@ -142,7 +161,7 @@ unsafe fn launch(command: &str, app: Option<&str>, log: Option<&File>) -> window
         let reader = pipe.map(|(read, write, file)| {
             let _ = CloseHandle(write);
             let read = read.0 as isize;
-            std::thread::spawn(move || copy_output(HANDLE(read as *mut c_void), file))
+            std::thread::spawn(move || copy_output(HANDLE(read as *mut c_void), file, code_page))
         });
         created?;
         let _ = CloseHandle(pi.hThread);
@@ -161,29 +180,122 @@ unsafe fn launch(command: &str, app: Option<&str>, log: Option<&File>) -> window
     }
 }
 
-/// Echo the app's output to the console and append it, minus escape sequences, to the log.
-fn copy_output(read: HANDLE, mut file: Option<File>) {
+/// Echo the app's output to the console and append it, minus escape sequences, to the
+/// log. The output is decoded from `code_page` and written to the console as UTF-16:
+/// written as bytes, the console would read them in its own code page (437, say). The
+/// log gets UTF-8.
+fn copy_output(read: HANDLE, mut file: Option<File>, code_page: u32) {
     unsafe {
         let out = GetStdHandle(STD_OUTPUT_HANDLE).unwrap_or_default();
         // Show colour sequences rather than printing them.
         let mut mode = CONSOLE_MODE::default();
-        if GetConsoleMode(out, &mut mode).is_ok() {
+        let is_console = GetConsoleMode(out, &mut mode).is_ok();
+        if is_console {
             let _ = SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
         }
+        let mut decoder = Decoder::new(code_page);
         let mut strip = AnsiStrip::default();
+        let mut write = |text: &str| {
+            if text.is_empty() {
+                return;
+            }
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            if !is_console || WriteConsoleW(out, &wide, None, None).is_err() {
+                let _ = WriteFile(out, Some(text.as_bytes()), None, None);
+            }
+            if let Some(f) = &mut file {
+                let _ = f.write_all(&strip.feed(text.as_bytes()));
+            }
+        };
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             let mut n = 0u32;
             if ReadFile(read, Some(&mut buf), Some(&mut n), None).is_err() || n == 0 {
                 break;
             }
-            let chunk = &buf[..n as usize];
-            let _ = WriteFile(out, Some(chunk), None, None);
-            if let Some(f) = &mut file {
-                let _ = f.write_all(&strip.feed(chunk));
+            write(&decoder.feed(&buf[..n as usize]));
+        }
+        write(&decoder.finish());
+        let _ = CloseHandle(read);
+    }
+}
+
+/// Decodes a byte stream fed in arbitrary chunks, holding back a character split
+/// between chunks. In UTF-8 mode, bytes that aren't valid UTF-8 are read in the ANSI
+/// code page instead: programs that ignore the console's code page usually write in it.
+struct Decoder {
+    code_page: u32,
+    pending: Vec<u8>,
+}
+
+impl Decoder {
+    fn new(code_page: u32) -> Decoder {
+        Decoder { code_page, pending: Vec::new() }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let buf = std::mem::take(&mut self.pending);
+        if self.code_page != CP_UTF8 {
+            // Hold back a trailing DBCS lead byte; its second byte is in the next chunk.
+            let mut i = 0;
+            while i < buf.len() {
+                let lead = unsafe { IsDBCSLeadByteEx(self.code_page, buf[i]) }.is_ok();
+                i += if lead { 2 } else { 1 };
+            }
+            let end = if i > buf.len() { buf.len() - 1 } else { buf.len() };
+            self.pending = buf[end..].to_vec();
+            return decode_code_page(self.code_page, &buf[..end]);
+        }
+        let mut out = String::with_capacity(buf.len());
+        let mut rest = &buf[..];
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    out.push_str(s);
+                    break;
+                }
+                Err(e) => {
+                    let (good, bad) = rest.split_at(e.valid_up_to());
+                    out.push_str(std::str::from_utf8(good).unwrap_or_default());
+                    match e.error_len() {
+                        // Cut off mid-character: wait for the rest.
+                        None => {
+                            self.pending = bad.to_vec();
+                            break;
+                        }
+                        Some(n) => {
+                            out.push_str(&decode_code_page(unsafe { GetACP() }, &bad[..n]));
+                            rest = &bad[n..];
+                        }
+                    }
+                }
             }
         }
-        let _ = CloseHandle(read);
+        out
+    }
+
+    /// Whatever was held back, at the end of the stream.
+    fn finish(&mut self) -> String {
+        let rest = std::mem::take(&mut self.pending);
+        let cp = if self.code_page == CP_UTF8 { unsafe { GetACP() } } else { self.code_page };
+        decode_code_page(cp, &rest)
+    }
+}
+
+fn decode_code_page(code_page: u32, bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    unsafe {
+        let flags = MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0);
+        let n = MultiByteToWideChar(code_page, flags, bytes, None);
+        if n <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let mut wide = vec![0u16; n as usize];
+        let n = MultiByteToWideChar(code_page, flags, bytes, Some(&mut wide));
+        String::from_utf16_lossy(&wide[..n.max(0) as usize])
     }
 }
 
@@ -238,8 +350,7 @@ fn say(text: &str) {
 }
 
 fn timestamp() -> String {
-    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
+    brady_bunch::events::timestamp()
 }
 
 /// Removes ANSI escape sequences from a byte stream fed in arbitrary chunks.
@@ -297,5 +408,29 @@ mod tests {
         let mut out = s.feed(b"\x1b[32minfo\x1b[");
         out.extend(s.feed(b"0m: ok\x1b]0;title\x07 done\x1b(B!\r\n"));
         assert_eq!(String::from_utf8(out).unwrap(), "info: ok done!\r\n");
+    }
+
+    #[test]
+    fn decodes_utf8_split_across_chunks() {
+        // "➜" (E2 9E 9C) cut after its first byte and after its second; "é" (C3 A9) too.
+        let mut d = Decoder::new(CP_UTF8);
+        let mut out = d.feed(b"  \xE2");
+        out += &d.feed(b"\x9E");
+        out += &d.feed(b"\x9C  Local \xC3\xA9t\xC3");
+        out += &d.feed(b"\xA9\r\n");
+        out += &d.finish();
+        assert_eq!(out, "  \u{279C}  Local \u{e9}t\u{e9}\r\n");
+    }
+
+    #[test]
+    fn decodes_invalid_utf8_and_other_code_pages() {
+        // A byte that can't be UTF-8 is read in the ANSI code page rather than dropped.
+        let mut d = Decoder::new(CP_UTF8);
+        let out = d.feed(b"a\xFFb");
+        assert_eq!(out.chars().count(), 3, "{out}");
+        assert!(out.starts_with('a') && out.ends_with('b'), "{out}");
+        // Code page 437: 0x82 is é, 0xC4 a box-drawing line.
+        let mut d = Decoder::new(437);
+        assert_eq!(d.feed(b"caf\x82 \xC4"), "caf\u{e9} \u{2500}");
     }
 }

@@ -17,8 +17,17 @@ With options (a pinned version, a check for updates):
     & ([scriptblock]::Create((irm https://github.com/ryancole/brady-bunch/releases/latest/download/install.ps1))) -Version 0.6.0
     & ([scriptblock]::Create((irm https://github.com/ryancole/brady-bunch/releases/latest/download/install.ps1))) -Check
 
+Whatever a config's min_version needs (nothing, if the installed version already meets it):
+
+    & ([scriptblock]::Create((irm https://github.com/ryancole/brady-bunch/releases/latest/download/install.ps1))) -Config C:\src\app\brady.toml
+
 .PARAMETER Version
 The version to install, e.g. 0.6.0. Default: the latest release.
+
+.PARAMETER Config
+A brady-bunch config. Installs what it needs: nothing if the installed version meets
+its min_version (or it has none and brady-bunch is installed), else the latest release
+(or -Version), which must meet min_version. For wrappers that run brady-ctl up.
 
 .PARAMETER InstallDir
 Where to install. Default: %LOCALAPPDATA%\Programs\brady-bunch.
@@ -35,6 +44,7 @@ Reinstall even if that version is already installed.
 [CmdletBinding()]
 param(
     [string]$Version,
+    [string]$Config,
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\brady-bunch'),
     [switch]$Check,
     [switch]$NoPath,
@@ -70,6 +80,39 @@ function Add-ToUserPath {
     }
 }
 
+function ConvertTo-VersionNumber([string]$v) {
+    if ($v -notmatch '^\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?\s*$') { return $null }
+    [version]::new([int]$Matches[1], [int]("0$($Matches[2])"), [int]("0$($Matches[3])"))
+}
+
+# The top-level min_version of a TOML config: before its first [table] header.
+function Get-MinVersion([string]$path) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Config $path not found." }
+    foreach ($line in Get-Content -LiteralPath $path) {
+        if ($line -match '^\s*\[') { break }
+        if ($line -match '^\s*min_version\s*=\s*(?:"([^"]*)"|''([^'']*)'')') {
+            $v = "$($Matches[1])$($Matches[2])"
+            if (-not (ConvertTo-VersionNumber $v)) { throw "min_version in $path isn't a version like ""0.6.0"": $v" }
+            return $v
+        }
+    }
+    return $null
+}
+
+if ($Config) {
+    $min = Get-MinVersion $Config
+    $installedNow = Get-InstalledVersion
+    $have = if ($installedNow) { ConvertTo-VersionNumber $installedNow }
+    if ($have -and (-not $min -or $have -ge (ConvertTo-VersionNumber $min)) -and -not $Force) {
+        Write-Output "brady-bunch $installedNow is installed in $InstallDir$(if ($min) { "; $Config needs $min or newer" })."
+        Add-ToUserPath
+        return
+    }
+    if ($Version -and $min -and (ConvertTo-VersionNumber $Version) -lt (ConvertTo-VersionNumber $min)) {
+        throw "$Config needs brady-bunch $min or newer; -Version $Version is older."
+    }
+}
+
 $headers = @{ 'User-Agent' = 'brady-bunch-install'; 'Accept' = 'application/vnd.github+json' }
 $api = if ($Version) {
     "https://api.github.com/repos/$repo/releases/tags/v$($Version.TrimStart('v'))"
@@ -85,6 +128,10 @@ if ($Check) {
     Write-Output "$(if ($Version) { 'requested' } else { 'latest' }):    $target"
     # `return`, not `exit`: run through iex, exit would close the caller's shell.
     return
+}
+
+if ($Config -and $min -and (ConvertTo-VersionNumber $target) -lt (ConvertTo-VersionNumber $min)) {
+    throw "$Config needs brady-bunch $min or newer, but the latest release is $target."
 }
 
 if ($installed -eq $target -and -not $Force) {

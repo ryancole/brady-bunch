@@ -65,8 +65,9 @@ pub struct Request {
 }
 
 /// `brady-bunch.exe` flags that are control commands rather than a launch.
-pub const VERBS: [&str; 11] = [
+pub const VERBS: [&str; 12] = [
     "--status", "--start", "--stop", "--restart", "--tail", "--up", "--down", "--wait", "--run", "--check", "--version",
+    "--events",
 ];
 
 pub const USAGE: &str = "usage: brady-ctl check [config] [--profile p] [--only a,b] [--skip a,b]
@@ -77,6 +78,7 @@ pub const USAGE: &str = "usage: brady-ctl check [config] [--profile p] [--only a
        brady-ctl start|stop|restart <app> [config|pid]
        brady-ctl run <task> [config|pid] [--stop a,b] [--timeout secs]
        brady-ctl tail <app> [config|pid] [--lines N]
+       brady-ctl events [config|pid] [--lines N] [--app name]
        brady-ctl --version
 
 The host is found by its config file (default: brady.toml in the working directory,
@@ -298,6 +300,7 @@ struct Opts {
     timeout: Option<Duration>,
     sel: Selection,
     stop: Vec<String>,
+    app: Option<String>,
 }
 
 fn usage(m: impl Into<String>) -> Failure {
@@ -308,6 +311,7 @@ fn usage(m: impl Into<String>) -> Failure {
 fn allowed(verb: &str) -> &'static [&'static str] {
     match verb {
         "tail" => &["--lines"],
+        "events" => &["--lines", "--app"],
         "up" => &["--profile", "--only", "--skip", "--timeout"],
         "check" => &["--profile", "--only", "--skip"],
         "down" | "wait" => &["--timeout"],
@@ -336,6 +340,7 @@ fn parse_opts(verb: &str, args: &[String]) -> Result<Opts, Failure> {
             "--only" => o.sel.only.extend(split_list(value)),
             "--skip" => o.sel.skip.extend(split_list(value)),
             "--stop" => o.stop.extend(split_list(value)),
+            "--app" => o.app = Some(value.clone()),
             _ => unreachable!(),
         }
     }
@@ -354,7 +359,7 @@ fn client(args: &[String]) -> Result<String, Failure> {
     let o = parse_opts(verb, &args[1..])?;
     let pos = |i: usize| o.positional.get(i).map(String::as_str);
     let max_positional = match verb {
-        "status" | "up" | "down" | "check" => 1,
+        "status" | "up" | "down" | "check" | "events" => 1,
         _ => 2,
     };
     if o.positional.len() > max_positional {
@@ -376,11 +381,14 @@ fn client(args: &[String]) -> Result<String, Failure> {
         "run" => {
             let task = needs_name("a task")?;
             let pipe = target_pipe(pos(1))?;
+            let start = Instant::now();
             let started = request(&pipe, &["run", task, &o.stop.join(",")])?;
-            let mut scope = vec![started["task"].as_str().unwrap_or(task).to_string()];
-            scope.extend(started["restarting"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(String::from));
-            wait_ready(&pipe, Some(&scope), timeout)
+            let task = started["task"].as_str().unwrap_or(task).to_string();
+            let apps: Vec<String> =
+                started["restarting"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(String::from).collect();
+            wait_run(&pipe, &task, &apps, start, timeout)
         }
+        "events" => events(pos(0), o.lines.unwrap_or(40), o.app.as_deref()),
         "tail" => {
             let app = needs_name("an app")?;
             let lines = o.lines.unwrap_or(40).to_string();
@@ -592,14 +600,10 @@ fn wait_ready(pipe: &str, scope: Option<&[String]>, timeout: Duration) -> Result
         let mut pending = Vec::new();
         let mut failed = Vec::new();
         for a in all.iter().filter(|a| wanted.contains(&name_of(a).to_lowercase())) {
-            if a["ready"] == true {
-                continue;
-            }
-            let restarting = !a["restart_in_ms"].is_null();
-            match a["state"].as_str().unwrap_or("") {
-                "failed" | "exited" if !restarting => failed.push(*a),
-                "stopped" => failed.push(*a),
-                _ => pending.push(*a),
+            match standing(a) {
+                Standing::Ready => {}
+                Standing::Failed => failed.push(*a),
+                Standing::Pending => pending.push(*a),
             }
         }
         if !failed.is_empty() {
@@ -619,6 +623,132 @@ fn wait_ready(pipe: &str, scope: Option<&[String]>, timeout: Duration) -> Result
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// How an app stands for a command waiting on it.
+#[derive(PartialEq)]
+enum Standing {
+    Ready,
+    Pending,
+    /// Failed, exited or stopped, with no restart coming.
+    Failed,
+}
+
+fn standing(a: &Value) -> Standing {
+    if a["ready"] == true {
+        return Standing::Ready;
+    }
+    let restarting = !a["restart_in_ms"].is_null();
+    match a["state"].as_str().unwrap_or("") {
+        "failed" | "exited" if !restarting => Standing::Failed,
+        "stopped" => Standing::Failed,
+        _ => Standing::Pending,
+    }
+}
+
+/// `brady-ctl run`: wait for the task, then for the apps it restarts, and say what
+/// happened to each.
+fn wait_run(pipe: &str, task: &str, restarting: &[String], start: Instant, timeout: Duration) -> Result<String, Failure> {
+    let restarted = if restarting.is_empty() { String::new() } else { format!("; restarted {}", restarting.join(", ")) };
+    let mut task_done: Option<f64> = None;
+    loop {
+        let status = request(pipe, &["status"]).map_err(|(code, e)| match code {
+            2 => (4, format!("brady-bunch exited while {task} was running")),
+            _ => (code, e),
+        })?;
+        if status["shutting_down"] == true {
+            return Err((4, "the host is shutting down".into()));
+        }
+        let all: Vec<&Value> = apps(&status).collect();
+        let find = |n: &str| all.iter().copied().find(|a| name_of(a).eq_ignore_ascii_case(n));
+        let t = find(task).ok_or_else(|| (3, format!("no task called \"{task}\"")))?;
+        let secs = start.elapsed().as_secs_f64();
+        if task_done.is_none() {
+            match t["state"].as_str().unwrap_or("") {
+                "done" => task_done = Some(secs),
+                "exited" | "failed" | "stopped" => {
+                    println!("{}", pretty(&status));
+                    let left = if restarting.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\nwaiting for {task} to succeed: {}. Fix the error, then brady-ctl run {task} again.",
+                            restarting.join(", ")
+                        )
+                    };
+                    return Err((4, format!("{} ({secs:.1}s){left}\n(brady-ctl tail {task} shows its console)", describe(t))));
+                }
+                _ => {}
+            }
+        }
+        if let Some(done) = task_done {
+            // The restarted apps, and anything they wait for.
+            let wanted = in_scope(&all, Some(restarting)).map_err(|e| (3, e))?;
+            let scoped: Vec<&Value> =
+                all.iter().copied().filter(|a| wanted.contains(&name_of(a).to_lowercase()) && !name_of(a).eq_ignore_ascii_case(task)).collect();
+            let failed: Vec<&Value> = scoped.iter().copied().filter(|a| standing(a) == Standing::Failed).collect();
+            if !failed.is_empty() {
+                println!("{}", pretty(&status));
+                let why: Vec<String> = failed.iter().map(|a| describe(a)).collect();
+                let first = name_of(failed[0]);
+                return Err((
+                    4,
+                    format!("{task}: done ({done:.1}s){restarted}; then:\n{}\n(brady-ctl tail {first} shows its console)", why.join("\n")),
+                ));
+            }
+            if scoped.iter().all(|a| standing(a) == Standing::Ready) {
+                let ready = if restarting.is_empty() { String::new() } else { format!("; ready ({secs:.1}s)") };
+                return Ok(format!("{task}: done ({done:.1}s){restarted}{ready}"));
+            }
+            if start.elapsed() >= timeout {
+                println!("{}", pretty(&status));
+                let why: Vec<String> = scoped.iter().filter(|a| standing(a) == Standing::Pending).map(|a| describe(a)).collect();
+                return Err((
+                    4,
+                    format!("{task}: done ({done:.1}s){restarted}; timed out after {}s:\n{}", timeout.as_secs(), why.join("\n")),
+                ));
+            }
+        } else if start.elapsed() >= timeout {
+            println!("{}", pretty(&status));
+            let left = if restarting.is_empty() { String::new() } else { format!("\n{} are waiting for it", restarting.join(", ")) };
+            return Err((4, format!("timed out after {}s:\n{}{left}", timeout.as_secs(), describe(t))));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// `brady-ctl events`: the end of the host's event log, read from the file, so it
+/// works after the host has exited.
+fn events(target: Option<&str>, lines: u32, app: Option<&str>) -> Result<String, Failure> {
+    let by_pid = target.is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()));
+    let pipe = target_pipe(target)?;
+    let path = match request(&pipe, &["status"]) {
+        Ok(status) => status["event_log"].as_str().map(PathBuf::from),
+        Err((2, _)) if by_pid => {
+            return Err((2, "no running brady-bunch has that pid; pass the config path to read the log it left".into()));
+        }
+        Err((2, _)) => {
+            let config = config::resolve_path(target.map(PathBuf::from));
+            config::event_log_path(&config).map_err(|e| (1, e))?
+        }
+        Err(e) => return Err(e),
+    };
+    let path = path.ok_or_else(|| (1, "the config has no event_log; add event_log = 'brady-events.log' to record events".to_string()))?;
+    let bytes = std::fs::read(&path).map_err(|e| (1, format!("couldn't read {}: {e}", path.display())))?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(tail_events(&text, lines as usize, app))
+}
+
+/// The last `lines` lines of an event log, only `app`'s if given.
+fn tail_events(text: &str, lines: usize, app: Option<&str>) -> String {
+    let prefix = app.map(|a| format!("{}:", a.trim().to_lowercase()));
+    let picked: Vec<&str> = text
+        .lines()
+        .filter(|l| prefix.as_ref().is_none_or(|p| crate::events::line_text(l).to_lowercase().starts_with(p.as_str())))
+        .collect();
+    let mut out = picked[picked.len().saturating_sub(lines.max(1))..].join("\n");
+    out.push('\n');
+    out
 }
 
 fn name_of(a: &Value) -> &str {
@@ -793,5 +923,23 @@ mod tests {
         assert!(parse_opts("wait", &args(&["api", "--timeout"])).is_err());
         let o = parse_opts("run", &args(&["build", "--stop", "api, worker"])).unwrap();
         assert_eq!(o.stop, ["api", "worker"]);
+        let o = parse_opts("events", &args(&["x.toml", "--app", "api", "--lines", "5"])).unwrap();
+        assert_eq!((o.app.as_deref(), o.lines), (Some("api"), Some(5)));
+        assert!(parse_opts("tail", &args(&["api", "--app", "x"])).is_err());
+    }
+
+    #[test]
+    fn events_tail_filters_by_app() {
+        let log = "2026-11-25 10:15:39.300-06:00 host started (pid 1) with C:\\a\\brady.toml\n\
+                   2026-11-25 10:15:39.315-06:00 api: launched (pid 12)\n\
+                   2026-11-25 10:15:39.320-06:00 api-worker: launched (pid 13)\n\
+                   2026-11-25 10:15:40.001-06:00 API: ready after 685 ms\n\
+                   2026-11-25 10:15:41.000-06:00 web: launched (pid 14)\n";
+        assert_eq!(tail_events(log, 2, None).lines().count(), 2);
+        assert!(tail_events(log, 2, None).ends_with("web: launched (pid 14)\n"));
+        let api = tail_events(log, 40, Some("api"));
+        assert_eq!(api.lines().count(), 2, "{api}");
+        assert!(api.contains("api: launched") && api.contains("API: ready"), "{api}");
+        assert_eq!(tail_events(log, 40, Some("nope")), "\n");
     }
 }

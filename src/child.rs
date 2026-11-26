@@ -1,7 +1,7 @@
 //! Child process lifecycle: launch into a job object, find and embed its window,
 //! check readiness, and shut it down gracefully.
 
-use crate::config::{AppConfig, ExitWith, Restart, Shutdown};
+use crate::config::{AppConfig, Encoding, ExitWith, Restart, Shutdown};
 use crate::ctrlc;
 use crate::events;
 use crate::ready::{self, Check, HealthGuard, ProbeGuard};
@@ -179,7 +179,7 @@ impl Child {
     pub fn new(index: usize, cfg: &AppConfig, ctx: &Context) -> Child {
         let exe = crate::config::first_token(&cfg.command);
         let console = cfg.console.unwrap_or_else(|| {
-            resolve_exe(&exe, cfg.cwd.as_deref(), &effective_path(&cfg.env)).is_some_and(|p| is_console_exe(&p))
+            resolve_exe(&exe, cfg.cwd.as_deref(), &effective_path(&launch_env(cfg))).is_some_and(|p| is_console_exe(&p))
         });
         let wants_log_ready = cfg.ready.as_ref().is_some_and(|r| r.log.is_some());
         let (capture, capture_is_temp) = match (&cfg.log, wants_log_ready) {
@@ -295,6 +295,7 @@ impl Child {
                     }
                 }
                 if self.readiness == Readiness::NoCheck && !self.cfg.task {
+                    self.became_ready();
                     self.ready_at = self.launched_at;
                 }
             }
@@ -317,14 +318,16 @@ impl Child {
         let app = exe.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe") || e.eq_ignore_ascii_case("com"));
         let app = app.then_some(exe.as_path());
         let shim = self.shim.as_deref().filter(|_| self.console);
+        let env = launch_env(cfg);
         let launch = LaunchSpec {
             command: &cfg.command,
             app,
             cwd: cfg.cwd.as_deref(),
             console: self.console,
-            env: &cfg.env,
+            env: &env,
             shim,
             capture: self.capture.as_deref(),
+            encoding: cfg.encoding,
             quick_edit: cfg.quick_edit,
         };
         unsafe { launch.run() }.map_err(|e| e.message())
@@ -492,7 +495,7 @@ impl Child {
                 if now {
                     events::log(format!("{}: healthy again", self.name));
                 } else {
-                    let what = self.cfg.ready.as_ref().map(Check::describe).unwrap_or_default();
+                    let what = self.cfg.health_check().as_ref().map(Check::describe).unwrap_or_default();
                     events::log(format!("{}: unhealthy: {what} failed {} checks in a row", self.name, h.0.failures()));
                 }
                 self.healthy = Some(now);
@@ -542,7 +545,7 @@ impl Child {
     fn became_ready(&mut self) {
         self.ready_at = Some(SystemTime::now());
         if let Some(h) = &self.cfg.health
-            && let Some(check) = self.cfg.ready.as_ref().and_then(|r| Check::from_config(r, None))
+            && let Some(check) = self.cfg.health_check().and_then(|r| Check::from_config(&r, None))
         {
             self.health = Some(ready::watch(check, Duration::from_millis(h.interval_ms), h.failures));
             self.healthy = Some(true);
@@ -554,7 +557,7 @@ impl Child {
         if self.healthy != Some(false) {
             return None;
         }
-        let what = self.cfg.ready.as_ref().map(Check::describe).unwrap_or_default();
+        let what = self.cfg.health_check().as_ref().map(Check::describe).unwrap_or_default();
         let n = self.health.as_ref().map_or(0, |h| h.0.failures());
         Some(format!("{what} failed {n} checks in a row"))
     }
@@ -889,6 +892,24 @@ struct Launched {
     pid: u32,
 }
 
+/// The app's `env`, with `path_prepend` and `path_append` applied to its PATH (or the
+/// host's). Folders that don't exist are left out, so the lists can name every place a
+/// tool might be installed.
+pub fn launch_env(cfg: &AppConfig) -> BTreeMap<String, String> {
+    let mut env = cfg.env.clone();
+    if cfg.path_prepend.is_empty() && cfg.path_append.is_empty() {
+        return env;
+    }
+    let existing = |dirs: &[String]| -> Vec<String> { dirs.iter().filter(|d| Path::new(d).is_dir()).cloned().collect() };
+    let key = env.keys().find(|k| k.eq_ignore_ascii_case("PATH")).cloned().unwrap_or_else(|| "PATH".into());
+    let base = effective_path(&env);
+    let mut parts = existing(&cfg.path_prepend);
+    parts.extend(base.split(';').filter(|p| !p.is_empty()).map(String::from));
+    parts.extend(existing(&cfg.path_append));
+    env.insert(key, parts.join(";"));
+    env
+}
+
 /// PATH as the app will see it.
 fn effective_path(env: &BTreeMap<String, String>) -> String {
     env.iter()
@@ -927,6 +948,7 @@ struct LaunchSpec<'a> {
     /// brady-shim.exe, for console apps when it's available.
     shim: Option<&'a Path>,
     capture: Option<&'a Path>,
+    encoding: Encoding,
     quick_edit: bool,
 }
 
@@ -944,6 +966,7 @@ impl LaunchSpec<'_> {
         }
         if let Some(c) = self.capture {
             vars.push(("BRADY_SHIM_LOG", c.to_string_lossy().into_owned()));
+            vars.push(("BRADY_SHIM_ENCODING", self.encoding.as_str().into()));
         }
         if self.quick_edit {
             vars.push(("BRADY_SHIM_QUICK_EDIT", "1".into()));
@@ -1087,7 +1110,7 @@ fn conhost_path() -> String {
 /// the exe that would run.
 fn preflight(cfg: &AppConfig, console: bool, has_shim: bool, captures: bool) -> std::result::Result<PathBuf, String> {
     let token = crate::config::first_token(&cfg.command);
-    let exe = resolve_exe(&token, cfg.cwd.as_deref(), &effective_path(&cfg.env)).ok_or_else(|| {
+    let exe = resolve_exe(&token, cfg.cwd.as_deref(), &effective_path(&launch_env(cfg))).ok_or_else(|| {
         format!("{token} not found in the app's folder or on PATH (run .cmd files and shell commands through cmd /c)")
     })?;
     if let Some(cwd) = &cfg.cwd
@@ -1109,7 +1132,7 @@ fn preflight(cfg: &AppConfig, console: bool, has_shim: bool, captures: bool) -> 
 pub fn check_launch(cfg: &AppConfig, shim_dir: &Path) -> std::result::Result<(), String> {
     let token = crate::config::first_token(&cfg.command);
     let console = cfg.console.unwrap_or_else(|| {
-        resolve_exe(&token, cfg.cwd.as_deref(), &effective_path(&cfg.env)).is_some_and(|p| is_console_exe(&p))
+        resolve_exe(&token, cfg.cwd.as_deref(), &effective_path(&launch_env(cfg))).is_some_and(|p| is_console_exe(&p))
     });
     let captures = cfg.log.is_some() || cfg.ready.as_ref().is_some_and(|r| r.log.is_some());
     preflight(cfg, console, shim_dir.join(SHIM_EXE).is_file(), captures).map(|_| ())
@@ -1314,6 +1337,7 @@ mod tests {
             env: &env,
             shim: None,
             capture: Some(Path::new(r"C:\logs\a.log")),
+            encoding: Encoding::Oem,
             quick_edit: false,
         };
         let (cmdline, vars) = spec.console_command(Some(Path::new(r"C:\bb\brady-shim.exe")));
@@ -1321,7 +1345,36 @@ mod tests {
         assert!(vars.contains(&("BRADY_SHIM_COMMAND", spec.command.to_string())));
         assert!(vars.contains(&("BRADY_SHIM_APP", r"C:\Windows\System32\cmd.exe".to_string())));
         assert!(vars.contains(&("BRADY_SHIM_LOG", r"C:\logs\a.log".to_string())));
+        assert!(vars.contains(&("BRADY_SHIM_ENCODING", "oem".to_string())));
         assert!(!vars.iter().any(|(k, _)| *k == "BRADY_SHIM_QUICK_EDIT"));
+    }
+
+    #[test]
+    fn path_lists_wrap_the_path_and_skip_missing_folders() {
+        let dir = std::env::temp_dir().join(format!("bb-pathlist-{}", std::process::id()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join("only-in-b.exe"), b"").unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let mut cfg = AppConfig {
+            command: "only-in-b".into(),
+            path_prepend: vec![s(&dir.join("missing")), s(&a)],
+            path_append: vec![s(&b)],
+            ..Default::default()
+        };
+        cfg.env.insert("Path".into(), r"C:\one;C:\two".into());
+        let env = launch_env(&cfg);
+        assert_eq!(env["Path"], format!(r"{};C:\one;C:\two;{}", s(&a), s(&b)));
+        assert!(!env.contains_key("PATH"));
+        // The exe lookup sees it, as for env.PATH.
+        assert!(check_launch(&cfg, &dir).is_ok(), "{:?}", check_launch(&cfg, &dir));
+        cfg.path_append.clear();
+        assert!(check_launch(&cfg, &dir).unwrap_err().contains("not found"));
+        // Without the lists, env is untouched.
+        cfg.path_prepend.clear();
+        assert_eq!(launch_env(&cfg), cfg.env);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

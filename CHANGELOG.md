@@ -4,6 +4,25 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+### Fixed
+
+- Non-ASCII output of apps with `log` or `ready.log` was garbled in the console (and in `brady-ctl tail`): brady-shim passed the bytes on to a console that read them in its OEM code page, so rspack's `➜` showed as `Γ₧£`. brady-shim now decodes the output and writes it to the console as text, and sets the console to UTF-8 so .NET and cmd write UTF-8 too. The `log` file is always UTF-8, and a `ready.log` regex can match non-ASCII text, including a character split between two reads.
+- `brady-ctl run <task>` printed the task's dependencies and the restarted apps as `ready: ...`, listing apps it hadn't touched. It now says what it did: `build: done (8.4s); restarted api, worker, functions; ready (14.8s)`, and on failure, what failed and which apps are left waiting.
+
+### Added
+
+- Per-app `encoding = "utf-8" | "oem" | "ansi"` (default `utf-8`): what an app with copied output writes. In UTF-8 mode, bytes that aren't valid UTF-8 are read in the ANSI code page.
+- `health` can name its own check: `health = { http = "https://localhost:8000" }` or `{ tcp = 8000 }`, for apps whose `ready` check is a `log` regex. Without one, it reuses the `ready` check as before.
+- `path_prepend = ['dir', ...]` and `path_append` (per app, per task and in `[defaults]`): folders added to the app's PATH after `env`, skipping ones that don't exist. Relative to the config file. The exe lookup uses them too.
+- `brady-ctl events [config|pid] [--lines N] [--app name]` prints the end of the event log, optionally only one app's lines. Given the config, it also works after the host has exited.
+- `brady-ctl status` has the `event_log` path (each app's `log` was already there, absolute).
+- `install.ps1 -Config <path>` installs what the config's `min_version` needs: nothing (without going online) if the installed version meets it, else the latest release.
+- When a config's `min_version` isn't met, the error includes the command that installs that version.
+
+### Changed
+
+- `event_log` lines, and the `----` lines in `log` files, have the local time with its UTC offset (`2026-11-25 19:02:36.893-06:00`), so they can be matched against `brady-ctl status` times, which are UTC. The `log` lines now also have milliseconds.
+
 ## [0.6.0] - 2026-11-25
 
 ### Added
