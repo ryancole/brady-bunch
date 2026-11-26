@@ -22,7 +22,7 @@ use windows::Win32::System::JobObjects::{
     TerminateJobObject,
 };
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, OpenProcess, PROCESS_INFORMATION,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, STARTF_USESHOWWINDOW, GetExitCodeProcess, OpenProcess, PROCESS_INFORMATION,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread,
     STARTUPINFOW, TerminateProcess,
 };
@@ -455,7 +455,7 @@ impl Child {
             if matches!(self.status, Status::Exited(_) | Status::Failed(_)) && !shutting_down {
                 // An app that exits quickly can leave before its console is embedded.
                 if self.window.is_none()
-                    && let Some(hwnd) = top_level_windows(&job_pids(job.handle.0)).into_iter().next()
+                    && let Some(hwnd) = job.find_window()
                 {
                     self.window = Some(unsafe { embed(hwnd, host) });
                     changed = true;
@@ -528,7 +528,7 @@ impl Child {
         }
         if self.window.is_none()
             && !shutting_down
-            && let Some(hwnd) = top_level_windows(&job_pids(job.handle.0)).into_iter().next()
+            && let Some(hwnd) = job.find_window()
         {
             self.window = Some(unsafe { embed(hwnd, host) });
             relayout = true;
@@ -716,6 +716,16 @@ impl Job {
         let names: Vec<String> = job_pids(self.handle.0).into_iter().map(|p| self.name_of(p)).collect();
         names.iter().any(|n| n.eq_ignore_ascii_case("cmd.exe"))
             && names.iter().all(|n| ["cmd.exe", "conhost.exe", SHIM_EXE].iter().any(|s| n.eq_ignore_ascii_case(s)))
+    }
+
+    /// The window to embed. For console apps, conhost's console window, which starts
+    /// hidden so it never shows in the taskbar; otherwise the first visible top-level
+    /// window of any process in the job.
+    fn find_window(&self) -> Option<HWND> {
+        if self.console {
+            return console_window(&job_pids(self.handle.0));
+        }
+        top_level_windows(&job_pids(self.handle.0)).into_iter().next()
     }
 
     /// The `brady-shim.exe --hold` process keeping the console open, if there is one.
@@ -1000,7 +1010,13 @@ impl LaunchSpec<'_> {
             let app_p = app_h.as_ref().map_or(PCWSTR::null(), |h| PCWSTR(h.as_ptr()));
             let cwd_h = self.cwd.map(HSTRING::from);
             let cwd_p = cwd_h.as_ref().map_or(PCWSTR::null(), |h| PCWSTR(h.as_ptr()));
-            let si = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+            let mut si = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+            if self.console {
+                // conhost creates its window hidden; it's shown once it's inside its tile,
+                // so it never appears on the desktop or in the taskbar on its own.
+                si.dwFlags |= STARTF_USESHOWWINDOW;
+                si.wShowWindow = SW_HIDE.0 as u16;
+            }
             let mut pi = PROCESS_INFORMATION::default();
             let env_block = (!self.env.is_empty() || !extra.is_empty()).then(|| environment_block(self.env, &extra));
             let mut flags = CREATE_SUSPENDED;
@@ -1273,6 +1289,37 @@ fn top_level_windows(pids: &[u32]) -> Vec<HWND> {
     s.found
 }
 
+/// The console window of any of `pids`, visible or not. Windows reports a console
+/// window as belonging to a process attached to the console, not to conhost.exe.
+fn console_window(pids: &[u32]) -> Option<HWND> {
+    struct Search<'a> {
+        pids: &'a [u32],
+        found: Option<HWND>,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lp: LPARAM) -> BOOL {
+        unsafe {
+            let s = &mut *(lp.0 as *mut Search);
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if s.pids.contains(&pid) {
+                let mut class = [0u16; 32];
+                let n = GetClassNameW(hwnd, &mut class) as usize;
+                if String::from_utf16_lossy(&class[..n]) == "ConsoleWindowClass" {
+                    s.found = Some(hwnd);
+                    return BOOL(0);
+                }
+            }
+            BOOL(1)
+        }
+    }
+    if pids.is_empty() {
+        return None;
+    }
+    let mut s = Search { pids, found: None };
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut s as *mut _ as isize)) };
+    s.found
+}
+
 unsafe fn embed(hwnd: HWND, host: HWND) -> Embedded {
     unsafe {
         if IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() {
@@ -1347,6 +1394,35 @@ mod tests {
         assert!(vars.contains(&("BRADY_SHIM_LOG", r"C:\logs\a.log".to_string())));
         assert!(vars.contains(&("BRADY_SHIM_ENCODING", "oem".to_string())));
         assert!(!vars.iter().any(|(k, _)| *k == "BRADY_SHIM_QUICK_EDIT"));
+    }
+
+    /// Consoles start hidden, so they never flash in the taskbar before being embedded,
+    /// and are still found to embed.
+    #[test]
+    fn consoles_start_hidden_and_are_found() {
+        let env = BTreeMap::new();
+        let spec = LaunchSpec {
+            command: "cmd /c ping -n 6 127.0.0.1 >nul",
+            app: None,
+            cwd: None,
+            console: true,
+            env: &env,
+            shim: None,
+            capture: None,
+            encoding: Encoding::Utf8,
+            quick_edit: false,
+        };
+        let launched = unsafe { spec.run() }.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = None;
+        while found.is_none() && Instant::now() < deadline {
+            found = launched.job.find_window();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let hwnd = found.expect("the console window wasn't found");
+        let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+        let _ = unsafe { TerminateJobObject(launched.job.handle.0, 1) };
+        assert!(!visible, "the console window was shown before it was embedded");
     }
 
     #[test]

@@ -6,6 +6,7 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ### Fixed
 
+- Console apps no longer flash on the desktop and in the taskbar as they start. Their console window was created visible and only embedded at the next poll; it is now created hidden and shown once it's in its tile. GUI apps still can show briefly (see Limitations in the README).
 - Paths from the config are shown resolved: `event_log` and each app's `log` in `brady-ctl status`, `cwd` and `log` in `brady-ctl check` and error messages, and the config path in the event log now read `C:\repo\.brady\events.log` rather than `C:\repo\etc\brady\..\..\.brady\events.log`. The `.` and `..` parts are resolved by the text alone, so the paths needn't exist yet. A config path given to `brady-ctl` finds its host however it is written: relative, absolute or with `..` parts.
 - `brady-ctl run <task>` listed the restarted apps in the order it stopped them (dependents first): `restarted functions, worker, api`. It now lists them in the order they start again, `restarted api, worker, functions`, also on failure.
 

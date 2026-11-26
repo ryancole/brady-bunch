@@ -43,7 +43,7 @@ git push origin v0.1.0
 - **Environment:** `%VAR%` in `command`, `cwd`, `env`, `log`, `url`, `ready` and `health` is expanded from the app's `env` and the host's environment. `path_prepend = ['C:\dir1', 'C:\dir2']` and `path_append` add folders to the app's PATH, skipping ones that don't exist.
 - **Shared settings:** a `[defaults]` table sets keys for every `[[app]]`. `--only`/`--skip` pick apps from the command line; `--only` brings in what they depend on. A `[profiles]` table names selections, e.g. `webdev = { skip = ["worker"] }`, used as `--profile webdev`.
 - **Version check:** `min_version = "0.7.0"` makes an older brady-bunch refuse the config with a message saying to update. `brady-ctl --version` prints the version.
-- **Tiling:** the first visible top-level window of any process in the app's job is reparented into a grid cell. If that window closes, for example a splash screen, the next one is picked up.
+- **Tiling:** the first visible top-level window of any process in the app's job is reparented into a grid cell. If that window closes, for example a splash screen, the next one is picked up. Console windows are created hidden and only shown inside their tile, so they never appear in the taskbar.
 - **Keyboard:** click inside a tile to type into it; the focused tile's header turns blue.
 - **One host per config:** launching a config that's already running brings its window to the front instead of starting a second host. `--new-instance` opts out.
 - **Crashes:** an app that exits with a non-zero code or fails to launch gets a red tile header, and the taskbar button flashes until you look (`flash_on_crash = false` turns the flashing off).
@@ -66,6 +66,7 @@ git push origin v0.1.0
 ## Limitations
 
 - Store/UWP apps (the new Notepad, Calculator, Windows Terminal) don't embed.
+- A GUI app's window can show on the desktop and in the taskbar for a moment before it's embedded, since brady-bunch can only pick it up once the app has shown it. Console apps don't.
 - Elevated apps can't be embedded by a host that isn't elevated.
 - `taskkill /f` on the host skips graceful shutdown; the job objects still kill the children.
 - With `log` (or `ready.log`), the app's output goes through a pipe, so the app no longer sees a console on stdout/stderr. Some programs then drop colours and progress bars, or buffer their output.
