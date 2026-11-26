@@ -28,6 +28,7 @@ shutdown_timeout_ms = 5000   # per shutdown step, before escalating
 # name = "build"
 # command = 'dotnet build src\App.sln -nodeReuse:false'
 # stops = ["api"]           # brady-ctl run build stops these first (they lock the output) and restarts them
+# skip_if_running = ["web"]  # skip it while that app is already running elsewhere (needs the app's running_if)
 
 [[app]]
 name = "ping"
@@ -57,6 +58,7 @@ command = "charmap.exe"
 # health = { interval_ms = 10000, failures = 3 }   # keep running the tcp/http ready check; show unhealthy when it keeps failing
 # health = { http = "https://localhost:8000" }    # or a check of its own (for a ready = { log = ... } app)
 # skip_if_ready = true       # don't launch if the ready check already passes (started elsewhere)
+# running_if = { process = "MyWorker" }   # or { tcp = 8000 } / { http = "..." }: don't launch if already running elsewhere
 # log = 'logs\charmap.log'   # copy console output to a file (as UTF-8)
 # encoding = "utf-8"         # utf-8 | oem | ansi: what the app writes, when its output is copied
 # quick_edit = true          # allow mouse selection in the console (off by default)

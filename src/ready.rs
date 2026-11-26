@@ -1,7 +1,8 @@
-//! Readiness checks: TCP connect, HTTP(S) GET, or a regex on the app's console output.
-//! Each runs on its own thread until it passes or is cancelled.
+//! Readiness checks: TCP connect, HTTP(S) GET, or a regex on the app's console output;
+//! and for `running_if`, whether a process is running. Each runs on its own thread
+//! until it passes or is cancelled.
 
-use crate::config::{ReadyConfig, TcpTarget};
+use crate::config::{ReadyConfig, RunningIf, TcpTarget};
 use regex_lite::Regex;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -9,7 +10,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Networking::WinHttp::*;
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 use windows::core::{HSTRING, PCWSTR, w};
 
 const INTERVAL: Duration = Duration::from_millis(250);
@@ -18,6 +26,8 @@ pub enum Check {
     Tcp(String),
     Http(String),
     Log { path: PathBuf, offset: u64, re: Regex },
+    /// A process with this image name, or this full path; `exclude` are the host's own.
+    Process { target: String, exclude: Vec<u32> },
 }
 
 impl Check {
@@ -34,6 +44,27 @@ impl Check {
         }
         let (path, offset) = log?;
         Some(Check::Log { path, offset, re: Regex::new(r.log.as_deref()?).ok()? })
+    }
+
+    /// The check for `running_if`, ignoring the processes in `exclude`.
+    pub fn from_running(r: &RunningIf, exclude: Vec<u32>) -> Option<Check> {
+        if let Some(p) = &r.process {
+            return Some(Check::Process { target: p.clone(), exclude });
+        }
+        let as_ready = ReadyConfig { tcp: r.tcp.clone(), http: r.http.clone(), log: None, timeout_ms: None };
+        Check::from_config(&as_ready, None)
+    }
+
+    /// What a `running_if` check found, for status and the event log, e.g.
+    /// `http https://localhost:8000 answered` or `process worker is running`.
+    pub fn describe_running(r: &RunningIf) -> String {
+        match &r.process {
+            Some(p) => format!("process {p} is running"),
+            None => {
+                let as_ready = ReadyConfig { tcp: r.tcp.clone(), http: r.http.clone(), log: None, timeout_ms: None };
+                format!("{} answered", Check::describe(&as_ready))
+            }
+        }
     }
 
     /// Short description for status and the event log, e.g. `tcp localhost:10000`.
@@ -92,6 +123,7 @@ pub fn spawn(mut check: Check, once: bool) -> ProbeGuard {
                 Check::Tcp(addr) => tcp_ok(addr),
                 Check::Http(url) => http_ok(url),
                 Check::Log { path, offset, re } => log_matches(path, offset, re, &mut tail),
+                Check::Process { target, exclude } => process_running(target, exclude),
             };
             if ok {
                 p.passed.store(true, Ordering::Release);
@@ -157,6 +189,7 @@ pub fn watch(mut check: Check, interval: Duration, failures: u32) -> HealthGuard
                 Check::Tcp(addr) => tcp_ok(addr),
                 Check::Http(url) => http_ok(url),
                 Check::Log { path, offset, re } => log_matches(path, offset, re, &mut tail),
+                Check::Process { target, exclude } => process_running(target, exclude),
             };
             if h.cancel.load(Ordering::Acquire) {
                 return;
@@ -173,6 +206,49 @@ pub fn watch(mut check: Check, interval: Duration, failures: u32) -> HealthGuard
         }
     });
     HealthGuard(health)
+}
+
+/// A process other than those in `exclude` runs `target`: an image name (`.exe`
+/// optional) or, if it has a path, that executable. Case doesn't matter.
+pub fn process_running(target: &str, exclude: &[u32]) -> bool {
+    let by_path = target.contains(['\\', '/']);
+    let want = if by_path { target.replace('/', "\\") } else { target.to_string() };
+    let want = want.strip_suffix(".exe").or_else(|| want.strip_suffix(".EXE")).unwrap_or(&want).to_lowercase();
+    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else { return false };
+    let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+    let mut found = false;
+    let mut more = unsafe { Process32FirstW(snap, &mut entry) }.is_ok();
+    while more && !found {
+        let pid = entry.th32ProcessID;
+        if pid != 0 && !exclude.contains(&pid) {
+            let name = if by_path {
+                image_path(pid).unwrap_or_default()
+            } else {
+                let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                String::from_utf16_lossy(&entry.szExeFile[..len])
+            };
+            let name = name.to_lowercase();
+            found = name.strip_suffix(".exe").unwrap_or(&name) == want;
+        }
+        more = unsafe { Process32NextW(snap, &mut entry) }.is_ok();
+    }
+    unsafe {
+        let _ = CloseHandle(snap);
+    }
+    found
+}
+
+/// Full path of a process's executable, if this user may ask.
+fn image_path(pid: u32) -> Option<String> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(h);
+        ok.ok()?;
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
 }
 
 fn tcp_ok(addr: &str) -> bool {
@@ -323,6 +399,21 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
+
+    #[test]
+    fn process_check_by_name_or_path_ignoring_excluded_pids() {
+        let me = std::env::current_exe().unwrap();
+        let stem = me.file_stem().unwrap().to_string_lossy().into_owned();
+        let pid = std::process::id();
+        assert!(process_running(&stem, &[]));
+        assert!(process_running(&format!("{}.EXE", stem.to_uppercase()), &[]));
+        assert!(process_running(&me.to_string_lossy(), &[]));
+        assert!(process_running(&me.to_string_lossy().replace('\\', "/"), &[]));
+        // The test binary's name is unique to this build, so it's only us.
+        assert!(!process_running(&stem, &[pid]));
+        assert!(!process_running(&me.with_file_name("no-such.exe").to_string_lossy(), &[]));
+        assert!(!process_running("no-such-process-name", &[]));
+    }
 
     #[test]
     fn tcp_check_sees_a_listener() {

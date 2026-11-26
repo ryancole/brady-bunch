@@ -43,7 +43,7 @@
 
    Exit code `0` means it's valid, and it prints the tasks, apps and start order. Exit code `1` means it isn't, with one problem per line, e.g. `C:\path\to\brady.toml:12: api: dotnet2 not found...`.
 
-3. Start it and wait until every task is done and every app is ready. If a host for this config is already running, `up` waits on that one instead:
+3. Start it and wait until every task is done and every app is ready. If a host for this config is already running, `up` waits on that one instead, first starting any apps this selection adds (see `up` below):
 
    ```powershell
    brady-ctl up C:\path\to\brady.toml --timeout 300
@@ -84,7 +84,7 @@ brady-bunch.exe --send-ctrl-c <pid>
 brady-bunch.exe --version
 
 brady-ctl check [config] [--profile name] [--only app,app] [--skip app,app]
-brady-ctl up [config] [--profile name] [--only app,app] [--skip app,app] [--timeout secs]
+brady-ctl up [config] [--profile name] [--only app,app] [--skip app,app] [--exact] [--timeout secs]
 brady-ctl down [config|pid] [--timeout secs]
 brady-ctl status [config|pid]
 brady-ctl wait <app> [config|pid] [--timeout secs]
@@ -97,11 +97,11 @@ brady-ctl --version
 
 - **Config path:** if no path is given, it uses `brady.toml` in the working directory, otherwise `brady.toml` next to the exe. Pass an absolute path to avoid ambiguity.
 - **`--only a,b`:** run only these apps, plus the apps they depend on (transitively) and every `[[task]]`.
-- **`--skip a,b`:** leave these apps or tasks out. Apps that depend on a skipped app don't wait for it. Use this instead of keeping a second, near-identical config: `brady-bunch.exe everything.toml --skip worker,functions`.
+- **`--skip a,b`:** leave these apps out. Apps that depend on a skipped app don't wait for it. Use this instead of keeping a second, near-identical config: `brady-bunch.exe everything.toml --skip worker,functions`. A skipped task stays in the host: it isn't run at startup (state `skipped`, and nothing waits for it), but `brady-ctl run <task>` runs it. So a "quick start" profile, `quick = { skip = ["build"] }`, can still rebuild later without a restart.
 - **`--profile name`:** apply a `[profiles]` entry from the config (its `only` and `skip`). Repeat it, or give a comma-separated list, to combine profiles; `--only`/`--skip` add to them.
 - **Unknown names** in `--profile`, `--only` and `--skip` are config errors.
 - **`--send-ctrl-c <pid>`:** a standalone utility. It sends Ctrl+C to the console that `<pid>` is attached to, which hits every process on that console, then exits. Exit codes: `0` sent, `1` bad pid, `2` couldn't attach (the process has no console, or doesn't exist), `3` send failed. Because the program is GUI-subsystem, the shell doesn't wait for it; use `Start-Process -Wait -PassThru` and read `.ExitCode`.
-- **One host per config.** Launching `brady-bunch.exe` for a config that a host is already running brings that host's window to the front (restoring it if minimized) and exits with code `0`, without starting anything. If the running host has a different set of apps (another `--profile`/`--only`/`--skip`), it shows an error instead. `--new-instance` starts a second host anyway; `brady-ctl` then only finds the second one by its pid.
+- **One host per config.** Launching `brady-bunch.exe` for a config that a host is already running brings that host's window to the front (restoring it if minimized) and exits with code `0`. If the launch selects apps the host isn't running (another `--profile`/`--only`/`--skip`), the host starts them first, as `brady-ctl up` does. `--new-instance` starts a second host anyway; `brady-ctl` then only finds the second one by its pid.
 - **`--no-dialog`:** report a fatal error (bad config, bad arguments) on stderr and in the `event_log`, and exit with code `1`, instead of showing a message box. `brady-ctl up` passes it.
 - **brady-bunch.exe prints nothing** apart from `--check`, the control commands and `--no-dialog` errors. Everything else shows in its window.
 
@@ -112,14 +112,14 @@ brady-ctl --version
 | Command | Does | Prints |
 |---|---|---|
 | `check [config]` | Validates the config without launching anything: syntax and unknown keys (with line numbers), `depends_on`/`stops` names, cycles, `ready` and `health` tables, profiles and `--only`/`--skip` names, and for every entry whether its exe can be found (in its `cwd`, then on PATH as its `env` sets it), whether its `cwd` exists, and whether `log` can work. Exit `1` if anything is wrong. | `ok: <config>`, then the profiles, tasks, apps and start order. Otherwise one `<config>:<line>: <app>: <problem>` line per problem. |
-| `up [config]` | Checks the config, starts `brady-bunch.exe` for it unless one is already running, then waits (`--timeout`, default 300s) until every task is done and every app is ready. Takes `--profile`, `--only` and `--skip`. Refuses (exit `3`) if the running host has a different set of apps. | `ready: build, db, api (12.3s)`. On failure, the status JSON, and the reason on stderr. |
+| `up [config]` | Checks the config, starts `brady-bunch.exe` for it unless one is already running, then waits (`--timeout`, default 300s) until every task in the selection is done or skipped and every app in it is ready. Takes `--profile`, `--only` and `--skip`. If a host is already running with another selection, `up` changes it: apps the selection adds are started (they wait for their dependencies as at startup), apps in both keep running, and apps it leaves out keep running too unless `--exact` is given, which stops them (dependents first) and drops them from status. Tasks aren't rerun; one skipped when the host started stays skipped. The host's `profiles`/`only`/`skip` become the new selection. The host `up` starts doesn't inherit `up`'s stdout or stderr, so capturing `up`'s output returns when `up` does. | `ready: build, db, api (12.3s)`, after `started: worker, functions`, `stopped: web` and `build was skipped when this host started; brady-ctl run build runs it` lines when it changed a running host. On failure, the status JSON, and the reason on stderr. |
 | `down [config\|pid]` | Shuts the host down like closing its window, and returns once it has exited. Exit `4` if an app had to be killed, or the host is still shutting down after `--timeout` (default 300s). Exit `0` if no host is running. | One `api: stopped by ctrl-c after 1834 ms` line per app. |
 | `status` | Nothing | The host and every app, as JSON (below). |
 | `start <app>` | Starts a stopped, exited or failed app. It waits for its dependencies first, like at startup. Returns at once. | The app's JSON. |
 | `stop <app>` | Stops the app with the same steps as shutdown, and returns once it has stopped. It isn't restarted automatically. | The app's JSON, with `last_stop`. |
 | `restart <app>` | Stops the app if it's running, then starts it. Returns once it has been launched (or is waiting for dependencies), not once it's ready. | The app's JSON. |
 | `wait <app>` | Waits (`--timeout`, default 300s) until the app is ready. Use it after `start` or `restart`, which return at launch. Fails at once if the app, or something it depends on, fails or exits without a restart scheduled. | `ready: build, db, api (3.1s)` (the app and what it depends on). On failure, as `up`. |
-| `run <task>` | Reruns a `[[task]]` once startup has finished: stops the task's `stops` apps and any `--stop` apps (dependents first), runs the task in its tile, then starts those apps again behind it. Waits (`--timeout`) for the task and those apps, like `up`. | What it did: `build: done (8.4s); restarted api, worker; ready (14.8s)`, times counted from when `run` started. On failure, the status JSON, and on stderr what failed and what's left waiting, e.g. `build: exited with code 1 (6.2s)` / `waiting for build to succeed: api, worker. ...`. |
+| `run <task>` | Reruns a `[[task]]` once startup has finished, or runs one that was skipped: stops the task's `stops` apps and any `--stop` apps (dependents first), runs the task in its tile, then starts those apps again behind it. Waits (`--timeout`) for the task and those apps, like `up`. If the task's `skip_if_running` finds one of its apps running elsewhere, the task is skipped again and `run` says so (`build: skipped (web is already running ...)`). | What it did: `build: done (8.4s); restarted api, worker; ready (14.8s)`, times counted from when `run` started. On failure, the status JSON, and on stderr what failed and what's left waiting, e.g. `build: exited with code 1 (6.2s)` / `waiting for build to succeed: api, worker. ...`. |
 | `tail <app>` | Nothing | The last 40 lines (`--lines N`) of the app's console, as plain text. Works for a running console app and for one that exited, since its console stays open. |
 | `events [config\|pid]` | Nothing | The last 40 lines (`--lines N`) of the host's `event_log`, or only one app's lines with `--app name`. Reads the file, so given the config it also works after the host has exited (or never started); the path comes from the running host, else from the config's `event_log`. Exit `1` if the config has no `event_log`. |
 
@@ -174,8 +174,9 @@ If `run`'s task fails, it exits `4`, the task's tile shows its output, and the a
 | `state` | Meaning |
 |---|---|
 | `waiting` | Not launched: waiting for `depends_on` apps or earlier tasks. `reason` names the first one, and why if it's stuck: `waiting for db (exited with code 1)`. |
-| `checking` | `skip_if_ready`: checking whether it's already running elsewhere. |
-| `external` | `skip_if_ready`: its `ready` check already passed, so it wasn't launched. Counts as ready. |
+| `checking` | `running_if`/`skip_if_ready`: checking whether it's already running elsewhere. For a task, its `skip_if_running` apps. |
+| `external` | Found already running elsewhere (`running_if` or `skip_if_ready`), so it wasn't launched. `reason` says what found it, e.g. `process WhatInBoxWorkerService is running, so it wasn't launched`. Counts as ready. |
+| `skipped` | A task that wasn't run: skipped by `--skip`/a profile (`skipped at startup`), or by `skip_if_running` (`web is already running (...)`). Counts as done; `brady-ctl run` runs it. |
 | `starting` | Launched; its `ready` check hasn't passed yet. |
 | `not-ready` | Launched, but its `ready` check didn't pass within `timeout_ms`. Still running, and still being checked. Its dependents keep waiting. |
 | `running` | Launched and ready (or has no `ready` check). |
@@ -224,7 +225,8 @@ Per `[[app]]`:
 | `depends_on` | array of names | none | Apps that must be ready before this one is launched (see Startup order). |
 | `ready` | table | none | When the app counts as ready: exactly one of `tcp`, `http` or `log`, plus optional `timeout_ms` (see Startup order). |
 | `health` | table | none | Keep checking the app after it's ready: `health = { interval_ms = 10000, failures = 3 }` (those are the defaults; `health = {}` uses them). The check is the table's own `tcp` or `http` (same forms as in `ready`), e.g. `health = { http = "https://localhost:8000" }` for a dev server whose `ready` has to be `log`; without one, it reuses the `ready` check, which must then be `tcp` or `http`. After `failures` failed checks in a row the app shows `unhealthy`; it's back to normal when one passes. Changes are logged in `event_log`. Nothing is restarted and dependents aren't affected. |
-| `skip_if_ready` | bool | `false` | Before launching, run the `ready` check once (`tcp` or `http` only). If it passes, the app is already running outside brady-bunch: it isn't launched, and shows `already running`. |
+| `running_if` | table | none | How to tell the app is already running outside brady-bunch, checked once before each launch: exactly one of `tcp` or `http` (as in `ready`), or `process = "WhatInBoxWorkerService"`. If it passes, the app isn't launched and shows `already running` (state `external`), counting as ready for its dependents. Independent of `ready`, so it works for apps whose `ready` is a `log` regex, and for apps with no endpoint at all. `process` matches a running process's image name, case-insensitively, with or without `.exe`; with a `\` or `/` it's a path to the executable (relative to the config file), for when the name alone is too common. Processes in this host's own jobs don't count. `%VAR%` is expanded. |
+| `skip_if_ready` | bool | `false` | Before launching, run the `ready` check once (`tcp` or `http` only). If it passes, the app is already running outside brady-bunch: it isn't launched, and shows `already running`. `running_if` replaces this when it's set. |
 | `log` | path | none | Copy the app's console output to this file, as UTF-8 with colour codes removed, while it still shows in the tile. Emptied when the host starts; restarts append, with a `---- <time> start` line before each run and `---- <time> exited with code N` after. Relative to the config file. Console apps only. See the caveat under Logs. |
 | `encoding` | `"utf-8"`, `"oem"` or `"ansi"` | `"utf-8"` | What the app writes when its output is copied (`log` or `ready.log`); ignored otherwise. See Logs. |
 | `url` | string | none | Shown as a link in the tile header; clicking it opens the default browser. |
@@ -235,7 +237,7 @@ Per `[[app]]`:
 | `restart` | `"never"`, `"on-failure"` or `"always"` | `"never"` | Relaunch the app after it exits on its own. `on-failure` covers a non-zero exit code or a failed launch. |
 | `restart_delay_ms` | integer | `1000` | Wait before an automatic restart. It doubles, up to 30s, each time the app exits within 10s of starting, and resets once it runs longer. |
 
-Per `[[task]]`: `command` (required), `name`, `cwd`, `env`, `path_prepend`, `path_append`, `console`, `log`, `encoding`, `quick_edit`, `shutdown`, `shutdown_timeout_ms`, and `exit_with`, which defaults to `"main"` for tasks so build servers left behind don't hold them open. Tasks also take `stops`: the apps `brady-ctl run <task>` stops before rerunning it and starts again after, e.g. `stops = ["api", "worker"]` for a build whose output those apps lock. Names left out by `--profile`/`--only`/`--skip` are ignored.
+Per `[[task]]`: `command` (required), `name`, `cwd`, `env`, `path_prepend`, `path_append`, `console`, `log`, `encoding`, `quick_edit`, `shutdown`, `shutdown_timeout_ms`, and `exit_with`, which defaults to `"main"` for tasks so build servers left behind don't hold them open. Tasks also take `stops`: the apps `brady-ctl run <task>` stops before rerunning it and starts again after, e.g. `stops = ["api", "worker"]` for a build whose output those apps lock. Names left out by `--profile`/`--only`/`--skip` are ignored. And `skip_if_running = ["web"]`: before the task runs, the named apps' `running_if` (or `skip_if_ready`) checks are run, and if one finds its app running elsewhere, the task is skipped (state `skipped`, counting as done), e.g. so `npm install` doesn't touch `node_modules` while another dev server uses it. The apps must have such a check; they needn't be in the selection. An app this host is running itself doesn't count (`stops` is for those).
 
 Config rules:
 
@@ -257,7 +259,7 @@ An app is ready:
 - with `ready = { tcp = 10000 }`: once something accepts TCP connections on localhost port 10000 (IPv4 or IPv6). `tcp = "127.0.0.1:10000"` checks a specific address;
 - with `ready = { http = "https://localhost:8002/health" }`: once a GET gets any HTTP response below 500. Certificates aren't checked, redirects aren't followed, and no proxy is used;
 - with `ready = { log = 'Now listening on' }`: once the regex matches console output written since this launch. This copies the app's output through a pipe, with the same caveat as `log`;
-- with `skip_if_ready`, when it was found already running.
+- with `running_if` or `skip_if_ready`, when it was found already running.
 
 Checks run every 250ms. `timeout_ms` (default 60000) only changes how a slow app is shown: after it, the app shows `not ready` and its dependents' tiles say so, but checking continues and the dependents start as soon as it passes. Nothing is killed.
 
@@ -387,8 +389,8 @@ Each tile's header shows the app name, its `url` as a link, and one of these sta
 | State | Meaning |
 |---|---|
 | `waiting for <app>…` | Not launched yet: waiting for a dependency or an earlier task. |
-| `checking…` | `skip_if_ready`: checking whether it's already running. |
-| `already running` | `skip_if_ready`: found running elsewhere, so not launched. Click the tile to check again. |
+| `checking…` | `running_if`/`skip_if_ready`: checking whether it's already running. |
+| `already running` | Found running elsewhere (`running_if`/`skip_if_ready`), so not launched. Click the tile to check again. |
 | `starting…` | Running; no window found yet, or its `ready` check hasn't passed. |
 | `not ready (pid N)` | Running, but its `ready` check didn't pass within `timeout_ms`. |
 | `unhealthy (pid N)` | Running, but its `health` check keeps failing. |

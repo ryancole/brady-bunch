@@ -4,6 +4,20 @@ All notable changes to brady-bunch. Each release's section is used as its GitHub
 
 ## [Unreleased]
 
+### Fixed
+
+- `brady-ctl up` could keep a caller that reads its output to end-of-file (`$out = brady-ctl up ...`, `| Tee-Object`, .NET's `RedirectStandardOutput`) waiting until the host exited. The host it starts no longer inherits any of `up`'s handles, including ones `up` itself inherited from its caller; it gets exactly NUL for stdin and stdout, and a pipe back to `up` for its startup errors.
+
+### Changed
+
+- Skipping a task (`--skip build`, or a profile's `skip`) no longer removes it from the host: it shows `skipped`, isn't run at startup, and `brady-ctl run build` still runs it. Apps don't wait for it. Skipping an app still leaves it out.
+- `brady-ctl up` against a host already running the config with other apps no longer refuses (exit 3). It starts the apps the new selection adds, leaves the ones both share running, and with `--exact` stops the ones it leaves out. Tasks aren't rerun: a task skipped when the host started stays skipped, and `up` says to `brady-ctl run` it. Launching `brady-bunch.exe` for a running config with another selection adds its apps the same way, then brings the window to the front. Status shows the latest selection.
+
+### Added
+
+- Per-app `running_if = { process = "WhatInBoxWorkerService" }` (or `{ tcp = 8000 }`, `{ http = "https://localhost:8000" }`): how to tell the app is already running elsewhere, so it isn't launched and shows `already running`, independent of its `ready` check. `process` matches an image name (`.exe` optional) or, with a path, that executable; processes this host started don't count. `skip_if_ready` still works as before for apps without it.
+- Per-task `skip_if_running = ["web"]`: don't run the task when one of these apps is found already running elsewhere (by its `running_if`, or `skip_if_ready` check), e.g. `npm install` while another dev server uses `node_modules`. The task shows `skipped` with the reason. Apps this host runs itself don't count; `stops` handles those.
+
 ## [0.7.1] - 2026-11-25
 
 ### Fixed

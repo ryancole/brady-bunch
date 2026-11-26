@@ -48,10 +48,13 @@ impl Drop for Handle {
 pub enum Status {
     /// Not launched: waiting for the apps it depends on.
     Waiting,
-    /// `skip_if_ready`: checking whether it's already running elsewhere.
+    /// `running_if`/`skip_if_ready` (or a task's `skip_if_running`): checking whether
+    /// it's already running elsewhere.
     Checking,
-    /// `skip_if_ready`: it was already running, so it wasn't launched.
+    /// It was already running elsewhere, so it wasn't launched.
     External,
+    /// A task that wasn't run: skipped by the selection, or by `skip_if_running`. Why.
+    Skipped(String),
     WaitingForWindow,
     Running,
     Exited(u32),
@@ -114,7 +117,17 @@ pub struct Embedded {
     ex_style: u32,
 }
 
+/// What `launch` needs to know about the rest of the host.
+#[derive(Default)]
+pub struct Precheck {
+    /// Every process in the host's jobs: not "already running elsewhere".
+    pub own_pids: Vec<u32>,
+    /// Apps this host is running (or starting) itself.
+    pub here: Vec<String>,
+}
+
 /// Paths shared by every child.
+#[derive(Clone)]
 pub struct Context {
     /// brady-shim.exe, if it's next to the host.
     pub shim: Option<PathBuf>,
@@ -146,8 +159,11 @@ pub struct Child {
     pub readiness: Readiness,
     ready_deadline: Instant,
     probe: Option<ProbeGuard>,
-    /// `skip_if_ready`'s one-off check.
-    precheck: Option<ProbeGuard>,
+    /// The one-off checks for whether it's already running: what each found if it
+    /// passes, and its probe.
+    precheck: Vec<(String, ProbeGuard)>,
+    /// What showed it was already running (`External`), e.g. `tcp localhost:8000 answered`.
+    pub external: Option<String>,
     /// Where the shim copies the app's output: `log`, or a temp file for `ready.log`.
     pub capture: Option<PathBuf>,
     capture_is_temp: bool,
@@ -220,7 +236,8 @@ impl Child {
             readiness: Readiness::NoCheck,
             ready_deadline: Instant::now(),
             probe: None,
-            precheck: None,
+            precheck: Vec::new(),
+            external: None,
             capture,
             capture_is_temp,
             keeper: None,
@@ -234,6 +251,9 @@ impl Child {
             healthy: None,
         };
         child.backoff = child.base_delay();
+        if cfg.held {
+            child.status = Status::Skipped("skipped at startup".into());
+        }
         child
     }
 
@@ -241,17 +261,29 @@ impl Child {
         self.cfg.restart_delay_ms.map_or(DEFAULT_RESTART_DELAY, Duration::from_millis)
     }
 
-    /// Launch, or with `skip_if_ready`, first check whether it's already running.
-    /// Called once the apps it depends on are ready.
-    pub fn launch(&mut self) {
-        if self.cfg.skip_if_ready
-            && let Some(check) = self.cfg.ready.as_ref().and_then(|r| Check::from_config(r, None))
+    /// Launch, or first check whether it's already running elsewhere (`running_if`,
+    /// `skip_if_ready`, or for a task, `skip_if_running`). Called once the apps it
+    /// depends on are ready.
+    pub fn launch(&mut self, ctx: &Precheck) {
+        let mut checks = Vec::new();
+        if self.cfg.task {
+            // Apps this host runs are its own business (`stops`), not a reason to skip.
+            for (app, r) in self.cfg.skip_checks.iter().filter(|(a, _)| !ctx.here.iter().any(|h| h.eq_ignore_ascii_case(a))) {
+                if let Some(c) = Check::from_running(r, ctx.own_pids.clone()) {
+                    checks.push((format!("{app} is already running ({})", Check::describe_running(r)), c));
+                }
+            }
+        } else if let Some(r) = self.cfg.running_check()
+            && let Some(c) = Check::from_running(&r, ctx.own_pids.clone())
         {
-            self.status = Status::Checking;
-            self.precheck = Some(ready::spawn(check, true));
+            checks.push((Check::describe_running(&r), c));
+        }
+        if checks.is_empty() {
+            self.start();
             return;
         }
-        self.start();
+        self.status = Status::Checking;
+        self.precheck = checks.into_iter().map(|(what, c)| (what, ready::spawn(c, true))).collect();
     }
 
     /// Launch (or relaunch) the app into a fresh job.
@@ -265,7 +297,8 @@ impl Child {
         self.window = None;
         self.restart_at = None;
         self.probe = None;
-        self.precheck = None;
+        self.precheck.clear();
+        self.external = None;
         self.started_at = Instant::now();
         self.status = Status::WaitingForWindow;
         if self.launched_once {
@@ -342,7 +375,7 @@ impl Child {
 
     /// Close whatever is left of the last run and wait for dependencies again.
     fn back_to_waiting(&mut self) {
-        self.precheck = None;
+        self.precheck.clear();
         if self.is_active() {
             return;
         }
@@ -352,7 +385,7 @@ impl Child {
 
     /// True if the tile is showing an app that is no longer running and can be started.
     pub fn can_restart(&self) -> bool {
-        matches!(self.status, Status::Exited(_) | Status::Failed(_) | Status::Stopped | Status::External)
+        matches!(self.status, Status::Exited(_) | Status::Failed(_) | Status::Stopped | Status::External | Status::Skipped(_))
     }
 
     /// Schedule an automatic restart if the app's restart policy calls for one.
@@ -388,6 +421,7 @@ impl Child {
     pub fn is_ready(&self) -> bool {
         match &self.status {
             Status::External => true,
+            Status::Skipped(_) => self.cfg.task,
             Status::WaitingForWindow | Status::Running => {
                 !self.cfg.task && matches!(self.readiness, Readiness::NoCheck | Readiness::Passed)
             }
@@ -396,23 +430,28 @@ impl Child {
         }
     }
 
-    /// A task that has finished successfully.
+    /// A task that has finished successfully, or was skipped.
     pub fn is_done(&self) -> bool {
-        self.cfg.task && self.status == Status::Exited(0)
+        self.cfg.task && matches!(self.status, Status::Exited(0) | Status::Skipped(_))
     }
 
     /// Track exit, readiness and window changes. Returns (repaint needed, relayout needed).
     pub fn poll(&mut self, host: HWND, shutting_down: bool) -> (bool, bool) {
         if self.status == Status::Checking {
-            let Some(p) = self.precheck.as_ref().map(|g| g.0.clone()) else { return (false, false) };
-            if !p.finished() {
+            let found = self.precheck.iter().find(|(_, g)| g.0.passed()).map(|(what, _)| what.clone());
+            if found.is_none() && !self.precheck.iter().all(|(_, g)| g.0.finished()) {
                 return (false, false);
             }
-            self.precheck = None;
-            if p.passed() {
-                let what = self.cfg.ready.as_ref().map(Check::describe).unwrap_or_default();
-                events::log(format!("{}: already running ({what} answered); not launched", self.name));
-                self.status = Status::External;
+            self.precheck.clear();
+            if let Some(what) = found {
+                if self.cfg.task {
+                    events::log(format!("{}: skipped: {what}", self.name));
+                    self.status = Status::Skipped(what);
+                } else {
+                    events::log(format!("{}: already running ({what}); not launched", self.name));
+                    self.status = Status::External;
+                    self.external = Some(what);
+                }
                 self.ready_at = Some(SystemTime::now());
             } else if !shutting_down {
                 self.start();
@@ -584,7 +623,7 @@ impl Child {
     /// Build the stop plan for a background thread, or None if nothing is running.
     pub fn stop_plan(&mut self, default_timeout_ms: u64, helper_exe: &Path) -> Option<StopPlan> {
         self.restart_at = None;
-        self.precheck = None;
+        self.precheck.clear();
         self.health = None;
         self.healthy = None;
         if !self.is_active() {
@@ -636,6 +675,11 @@ impl Child {
         self.job = None;
         self.keeper = None;
         self.window = None;
+    }
+
+    /// Pids of every process in the app's job.
+    pub fn job_pids(&self) -> Vec<u32> {
+        self.job.as_ref().map(|j| job_pids(j.handle.0)).unwrap_or_default()
     }
 
     /// Pids of the processes attached to the app's console, for reading its text.

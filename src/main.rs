@@ -73,7 +73,12 @@ struct Ui {
     columns: Option<u32>,
     timeout_ms: u64,
     helper_exe: PathBuf,
+    /// What every child is created with, kept for apps added by a later `up`.
+    ctx: child::Context,
     children: Vec<Child>,
+    /// Whether each child is part of the host's selection. An app a later `up --exact`
+    /// left out stays in `children` (indices don't change), stopped and hidden.
+    selected: Vec<bool>,
     /// For each child, the children it waits for.
     deps: Vec<Vec<usize>>,
     shutting_down: bool,
@@ -136,15 +141,13 @@ fn main() {
     if !launch.new_instance
         && let Some(status) = control::running_host(&path)
     {
+        // Start whatever this selection adds to it.
         let mut want: Vec<String> = cfg.entries.iter().map(|e| e.name().to_lowercase()).collect();
         want.sort();
-        if control::app_names(&status) != want {
-            fatal(&format!(
-                "brady-bunch is already running this config (pid {}) with other apps: {}.\n\n\
-                 Close it first, or start with --new-instance to run a second host.",
-                status["host_pid"],
-                control::app_names(&status).join(", ")
-            ));
+        if control::app_names(&status) != want
+            && let Err(e) = control::change_selection(&path, &launch.sel, false)
+        {
+            fatal(&format!("brady-bunch is already running this config (pid {}), and couldn't add apps to it: {e}", status["host_pid"]));
         }
         control::activate(&status);
         std::process::exit(0);
@@ -262,7 +265,9 @@ unsafe fn run(cfg: config::Loaded, config_path: PathBuf) -> Result<()> {
                 columns: cfg.columns,
                 timeout_ms: cfg.shutdown_timeout_ms,
                 helper_exe: helper_exe.clone(),
+                ctx: ctx.clone(),
                 children,
+                selected: vec![true; n],
                 deps: cfg.deps.clone(),
                 shutting_down: false,
                 pending_stops: 0,
@@ -419,6 +424,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     Cmd::Run { task, stop } => {
                         with_ui(|ui| ui.start_run(&task, &stop, reply));
                     }
+                    Cmd::Select { sel, exact } => {
+                        let result = with_ui(|ui| ui.select(sel, exact))
+                            .unwrap_or_else(|| Err("the host is busy; try again".into()));
+                        let _ = reply.send(result);
+                    }
                     cmd => {
                         let result =
                             with_ui(|ui| ui.control(cmd)).unwrap_or_else(|| Err("the host is busy; try again".into()));
@@ -510,13 +520,28 @@ impl Ui {
         loop {
             let held = self.run.as_ref().map(|r| r.task);
             let next = (0..self.children.len()).find(|&i| {
-                self.children[i].status == Status::Waiting
+                self.selected[i]
+                    && self.children[i].status == Status::Waiting
                     && Some(i) != held
                     && self.deps[i].iter().all(|&d| self.children[d].is_ready())
             });
             let Some(i) = next else { return any };
-            self.children[i].launch();
+            let ctx = self.precheck();
+            self.children[i].launch(&ctx);
             any = true;
+        }
+    }
+
+    /// What a launch checks against: this host's own processes and running apps.
+    fn precheck(&self) -> child::Precheck {
+        child::Precheck {
+            own_pids: self.children.iter().flat_map(Child::job_pids).collect(),
+            here: self
+                .children
+                .iter()
+                .filter(|c| !c.cfg.task && (c.is_active() || matches!(c.status, Status::StopQueued | Status::Stopping)))
+                .map(|c| c.name.clone())
+                .collect(),
         }
     }
 
@@ -525,10 +550,10 @@ impl Ui {
         (0..self.children.len()).find(|&i| self.children[i].cfg.task && !self.children[i].is_done())
     }
 
-    /// Whether each tile is in the grid: apps always, tasks only while running setup.
+    /// Whether each tile is in the grid: selected apps always, tasks only while running setup.
     fn shown_tiles(&self) -> Vec<bool> {
         let task = self.current_task();
-        (0..self.children.len()).map(|i| !self.children[i].cfg.task || Some(i) == task).collect()
+        (0..self.children.len()).map(|i| self.selected[i] && (!self.children[i].cfg.task || Some(i) == task)).collect()
     }
 
     /// Tile rects for each child: a near-square grid; a short last row stretches to fill.
@@ -767,6 +792,7 @@ impl Ui {
             },
             Status::Checking => ("checking…".into(), WARN),
             Status::External => ("already running".into(), OK),
+            Status::Skipped(_) => ("skipped".into(), DIM),
             Status::WaitingForWindow | Status::Running if c.healthy == Some(false) => {
                 (format!("unhealthy (pid {})", c.pid), BAD)
             }
@@ -795,9 +821,10 @@ impl Ui {
             Status::Waiting => self.waiting_for(i).map(|w| (format!("Waiting for {w}"), WARN)),
             Status::Checking => Some(("Checking whether it's already running…".into(), WARN)),
             Status::External => {
-                let what = c.cfg.ready.as_ref().map(Check::describe).unwrap_or_default();
-                Some((format!("Already running ({what} answered), so not launched. Click to check again."), OK))
+                let what = c.external.clone().unwrap_or_default();
+                Some((format!("Already running ({what}), so not launched. Click to check again."), OK))
             }
+            Status::Skipped(why) => Some((format!("Skipped: {why}."), DIM)),
             Status::Stopped => Some(("Stopped. Click to start.".into(), TEXT)),
             _ if c.restart_in_secs().is_some() => Some((
                 format!("Restarting in {}s… (click to restart now)", c.restart_in_secs().unwrap_or(0)),
@@ -843,12 +870,14 @@ impl Ui {
     // ---- Command-line control ----
 
     fn find(&self, name: &str) -> std::result::Result<usize, String> {
-        let hits: Vec<usize> =
-            (0..self.children.len()).filter(|&i| self.children[i].name.eq_ignore_ascii_case(name.trim())).collect();
+        let hits: Vec<usize> = (0..self.children.len())
+            .filter(|&i| self.selected[i] && self.children[i].name.eq_ignore_ascii_case(name.trim()))
+            .collect();
         match hits[..] {
             [i] => Ok(i),
             [] => {
-                let all: Vec<&str> = self.children.iter().map(|c| c.name.as_str()).collect();
+                let all: Vec<&str> =
+                    (0..self.children.len()).filter(|&i| self.selected[i]).map(|i| self.children[i].name.as_str()).collect();
                 Err(format!("no app called \"{name}\"; the apps are: {}", all.join(", ")))
             }
             _ => Err(format!("more than one app is called \"{name}\"")),
@@ -893,7 +922,7 @@ impl Ui {
                 }
                 return Ok(json!({ "host_pid": std::process::id() }));
             }
-            Cmd::Quit | Cmd::Run { .. } => return Err("not handled here".into()),
+            Cmd::Quit | Cmd::Run { .. } | Cmd::Select { .. } => return Err("not handled here".into()),
         };
         self.gate();
         self.invalidate();
@@ -926,6 +955,7 @@ impl Ui {
                 });
             }
             None if then_start => c.request_start(),
+            None if matches!(c.status, Status::Skipped(_)) => {}
             None => c.status = Status::Stopped,
         }
     }
@@ -991,7 +1021,9 @@ impl Ui {
             return Err(format!("the task {} is still running; wait for it to finish", busy.name));
         }
         let mut apps = Vec::new();
-        for n in self.children[t].cfg.stops.iter().chain(stop) {
+        // The task's own `stops` may name apps a later `up --exact` left out.
+        let own = self.children[t].cfg.stops.iter().filter(|n| self.find(n).is_ok());
+        for n in own.chain(stop) {
             let i = self.find(n)?;
             if self.children[i].cfg.task {
                 return Err(format!("{} is a task; only apps can be stopped", self.children[i].name));
@@ -1028,6 +1060,110 @@ impl Ui {
         })));
     }
 
+    /// `brady-ctl up` with another selection: start the apps it adds, and with `exact`
+    /// stop the ones it leaves out. Apps in both keep running. Tasks aren't rerun.
+    fn select(&mut self, sel: config::Selection, exact: bool) -> std::result::Result<Value, String> {
+        if self.shutting_down {
+            return Err("the host is shutting down".into());
+        }
+        if self.run.is_some() {
+            return Err("a brady-ctl run is stopping apps; try again once it has finished".into());
+        }
+        let cfg = config::load(&self.config_path, &sel)?;
+        let mut added = Vec::new();
+        let mut index = Vec::with_capacity(cfg.entries.len());
+        for e in &cfg.entries {
+            let i = match self.children.iter().position(|c| c.name.eq_ignore_ascii_case(e.name())) {
+                Some(i) => {
+                    if !self.selected[i] {
+                        self.selected[i] = true;
+                        added.push(i);
+                        if self.children[i].can_restart() {
+                            self.children[i].request_start();
+                        }
+                    }
+                    i
+                }
+                None => {
+                    let i = self.children.len();
+                    let mut c = Child::new(i, e, &self.ctx);
+                    if e.task {
+                        // Only new if the config gained a task since the host started.
+                        c.status = Status::Skipped("added to the config after the host started".into());
+                    } else {
+                        added.push(i);
+                    }
+                    self.children.push(c);
+                    self.selected.push(true);
+                    self.start_after_stop.push(false);
+                    self.deps.push(Vec::new());
+                    i
+                }
+            };
+            index.push(i);
+        }
+        for (k, d) in cfg.deps.iter().enumerate() {
+            self.deps[index[k]] = d.iter().map(|&j| index[j]).collect();
+        }
+        // Tasks this selection would run that were skipped when the host started.
+        let skipped: Vec<String> = cfg
+            .entries
+            .iter()
+            .zip(&index)
+            .filter(|&(e, &i)| !e.held && matches!(self.children[i].status, Status::Skipped(_)))
+            .map(|(_, &i)| self.children[i].name.clone())
+            .collect();
+        let mut leaving = Vec::new();
+        if exact {
+            let out: Vec<usize> = (0..self.children.len())
+                .filter(|&i| self.selected[i] && !self.children[i].cfg.task && !index.contains(&i))
+                .collect();
+            let mut order = config::in_start_order(&self.deps, &out);
+            order.reverse();
+            let mut plans = Vec::new();
+            for &i in &order {
+                self.selected[i] = false;
+                self.focused = self.focused.filter(|&f| f != i);
+                self.zoomed = self.zoomed.filter(|&z| z != i);
+                match self.children[i].stop_plan(self.timeout_ms, &self.helper_exe) {
+                    Some(p) => plans.push((i, p)),
+                    None => self.children[i].status = Status::Stopped,
+                }
+            }
+            leaving = order;
+            self.manual_stops += plans.len();
+            let host = self.hwnd.0 as isize;
+            std::thread::spawn(move || {
+                let post = |msg, i, lp| unsafe {
+                    let _ = PostMessageW(Some(HWND(host as *mut _)), msg, WPARAM(i), LPARAM(lp));
+                };
+                for (i, plan) in plans {
+                    post(WM_APP_STOPPING, i, 0);
+                    let outcome = plan.run();
+                    post(WM_APP_MANUAL_STOPPED, i, encode_outcome(outcome));
+                }
+            });
+        }
+        self.selection = cfg.selection.clone();
+        let names = |list: &[usize]| -> Vec<String> { list.iter().map(|&i| self.children[i].name.clone()).collect() };
+        let (added_names, leaving_names) = (names(&config::in_start_order(&self.deps, &added)), names(&leaving));
+        events::log(format!(
+            "selection changed ({}){}{}",
+            if self.selection.to_args().is_empty() { "everything".to_string() } else { self.selection.to_args().join(" ") },
+            if added_names.is_empty() { String::new() } else { format!("; starting {}", added_names.join(", ")) },
+            if leaving_names.is_empty() { String::new() } else { format!("; stopping {}", leaving_names.join(", ")) },
+        ));
+        self.gate();
+        self.layout();
+        self.invalidate();
+        Ok(json!({
+            "added": added_names,
+            "stopping": leaving_names,
+            "skipped_tasks": skipped,
+            "apps": cfg.entries.iter().map(|e| e.name()).collect::<Vec<_>>(),
+        }))
+    }
+
     fn on_manual_stopped(&mut self, index: usize, outcome: StopOutcome) -> bool {
         self.manual_stops = self.manual_stops.saturating_sub(1);
         if let Some(c) = self.children.get_mut(index) {
@@ -1058,17 +1194,28 @@ impl Ui {
             "skip": self.selection.skip,
             "event_log": self.event_log.as_ref().map(|p| p.to_string_lossy()),
             "shutting_down": self.shutting_down,
-            "apps": (0..self.children.len()).map(|i| self.app_json(i)).collect::<Vec<_>>(),
+            "apps": (0..self.children.len())
+                .filter(|&i| self.selected[i] || matches!(self.children[i].status, Status::StopQueued | Status::Stopping))
+                .map(|i| self.app_json(i))
+                .collect::<Vec<_>>(),
         })
     }
 
     fn app_json(&self, i: usize) -> Value {
         let c = &self.children[i];
         let check = c.cfg.ready.as_ref().map(Check::describe);
+        let checking = if c.cfg.task {
+            let apps: Vec<&str> = c.cfg.skip_checks.iter().map(|(a, _)| a.as_str()).collect();
+            format!("checking whether {} is already running", apps.join(" or "))
+        } else {
+            let what = c.cfg.running_check().map(|r| Check::describe_running(&r)).unwrap_or_default();
+            format!("checking whether it's already running ({})", what.trim_end_matches(" answered").trim_end_matches(" is running"))
+        };
         let (state, reason): (&str, Option<String>) = match &c.status {
             Status::Waiting => ("waiting", self.waiting_for(i).map(|w| format!("waiting for {w}"))),
-            Status::Checking => ("checking", check.map(|w| format!("checking whether {w} already answers"))),
-            Status::External => ("external", check.map(|w| format!("{w} already answered, so it wasn't launched"))),
+            Status::Checking => ("checking", Some(checking)),
+            Status::External => ("external", c.external.as_ref().map(|w| format!("{w}, so it wasn't launched"))),
+            Status::Skipped(why) => ("skipped", Some(format!("{why}; brady-ctl run {} runs it", c.name))),
             Status::WaitingForWindow | Status::Running if c.healthy == Some(false) => {
                 ("unhealthy", c.unhealthy_reason())
             }

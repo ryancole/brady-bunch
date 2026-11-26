@@ -117,6 +117,18 @@ fn default_health_failures() -> u32 {
     3
 }
 
+/// `running_if`: how to tell the app is already running outside brady-bunch, so it
+/// isn't launched. Exactly one key.
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RunningIf {
+    pub tcp: Option<TcpTarget>,
+    pub http: Option<String>,
+    /// A process with this image name (`WhatInBoxWorkerService`, `.exe` optional), or
+    /// with a path, this executable. Processes this host started don't count.
+    pub process: Option<String>,
+}
+
 /// Raw config file layout. Only used to report errors with line numbers; the real
 /// parse happens after `[defaults]` are merged into each app.
 #[derive(Deserialize, Debug)]
@@ -225,6 +237,8 @@ pub struct AppConfig {
     /// Don't launch the app if its `ready` check already passes.
     #[serde(default)]
     pub skip_if_ready: bool,
+    /// Don't launch the app if this check passes (instead of `skip_if_ready`'s `ready`).
+    pub running_if: Option<RunningIf>,
     /// Keep running the `ready` check after startup, and show the app as unhealthy
     /// when it keeps failing.
     pub health: Option<HealthConfig>,
@@ -241,6 +255,15 @@ pub struct AppConfig {
     /// Tasks: apps that `brady-ctl run` stops while the task reruns, then starts again.
     #[serde(skip)]
     pub stops: Vec<String>,
+    /// Tasks: skip the task if any of these apps is already running outside the host.
+    #[serde(skip)]
+    pub skip_if_running: Vec<String>,
+    /// Tasks: `skip_if_running`'s apps with their checks, filled in by `load`.
+    #[serde(skip)]
+    pub skip_checks: Vec<(String, RunningIf)>,
+    /// Tasks: skipped by the selection. Not run at startup, but `brady-ctl run` runs it.
+    #[serde(skip)]
+    pub held: bool,
     /// Line of the entry's `[[app]]` or `[[task]]` header in the config, for messages.
     #[serde(skip)]
     pub line: usize,
@@ -272,6 +295,9 @@ pub struct TaskConfig {
     /// Apps to stop while `brady-ctl run` reruns this task, e.g. ones that lock its output.
     #[serde(default)]
     pub stops: Vec<String>,
+    /// Don't run the task if one of these apps is found already running elsewhere.
+    #[serde(default)]
+    pub skip_if_running: Vec<String>,
 }
 
 fn task_exit_with() -> ExitWith {
@@ -296,6 +322,7 @@ impl From<TaskConfig> for AppConfig {
             shutdown_timeout_ms: t.shutdown_timeout_ms,
             task: true,
             stops: t.stops,
+            skip_if_running: t.skip_if_running,
             ..Default::default()
         }
     }
@@ -308,6 +335,16 @@ impl AppConfig {
 
     pub fn ready_timeout_ms(&self) -> u64 {
         self.ready.as_ref().and_then(|r| r.timeout_ms).unwrap_or(DEFAULT_READY_TIMEOUT_MS)
+    }
+
+    /// How to tell the app is already running elsewhere: `running_if`, else with
+    /// `skip_if_ready` its `ready` check. None if it's always launched.
+    pub fn running_check(&self) -> Option<RunningIf> {
+        if let Some(r) = &self.running_if {
+            return Some(r.clone());
+        }
+        let r = self.ready.as_ref().filter(|_| self.skip_if_ready)?;
+        Some(RunningIf { tcp: r.tcp.clone(), http: r.http.clone(), process: None })
     }
 
     /// The check `health` runs: its own `tcp`/`http`, else the `ready` check. None
@@ -467,6 +504,7 @@ fn parse(text: &str, config_dir: &Path, sel: &Selection) -> Result<Loaded, Strin
         e.line = lines.next().unwrap_or(0);
     }
     let deps = dependencies(&entries)?;
+    resolve_skip_if_running(&mut entries)?;
     let selection = with_profiles(&cfg.profiles, sel, &entries)?;
     let (mut entries, deps) = select(entries, deps, &selection)?;
     // Apps a task stops may have been left out by the selection.
@@ -489,6 +527,33 @@ fn parse(text: &str, config_dir: &Path, sel: &Selection) -> Result<Loaded, Strin
         deps,
         selection: Selection { profiles: selection.profiles, ..sel.clone() },
     })
+}
+
+/// Give each task the checks of the apps in its `skip_if_running`.
+fn resolve_skip_if_running(entries: &mut [AppConfig]) -> Result<(), String> {
+    for i in 0..entries.len() {
+        let mut checks = Vec::new();
+        for n in &entries[i].skip_if_running {
+            let e = &entries[i];
+            let j = find(entries, n).map_err(|err| format!("{}{} skip_if_running: {err}", at(e), e.name()))?;
+            let app = &entries[j];
+            if app.task {
+                return Err(format!("{}{} skip_if_running names the task {n}; it takes apps.", at(e), e.name()));
+            }
+            let check = app.running_check().ok_or_else(|| {
+                format!(
+                    "{}{} skip_if_running: {} has no way to tell it's running; give it `running_if` \
+                     (or `skip_if_ready` with a tcp or http `ready` check).",
+                    at(e),
+                    e.name(),
+                    app.name()
+                )
+            })?;
+            checks.push((app.name().to_string(), check));
+        }
+        entries[i].skip_checks = checks;
+    }
+    Ok(())
 }
 
 /// `min_version = "0.6.0"`: refuse to run under an older brady-bunch.
@@ -614,6 +679,16 @@ fn resolve_entry(e: &mut AppConfig, config_dir: &Path) {
             *tcp = Some(TcpTarget::Addr(expand(a, &app_env)));
         }
     }
+    if let Some(r) = &mut e.running_if {
+        r.http = r.http.as_ref().map(|u| expand(u, &app_env));
+        if let Some(TcpTarget::Addr(a)) = &r.tcp {
+            r.tcp = Some(TcpTarget::Addr(expand(a, &app_env)));
+        }
+        r.process = r.process.as_ref().map(|p| {
+            let p = expand(p, &app_env);
+            if p.contains(['\\', '/']) { absolute_in(config_dir, &p).to_string_lossy().into_owned() } else { p }
+        });
+    }
     e.env = env;
     if e.name.is_none() {
         let exe = first_token(&e.command);
@@ -722,8 +797,26 @@ fn dependencies(entries: &[AppConfig]) -> Result<Vec<Vec<usize>>, String> {
                 return Err(format!("{}{} stops the task {n}; only apps can be stopped.", at(e), e.name()));
             }
         }
-        if e.skip_if_ready && !e.ready.as_ref().is_some_and(|r| r.tcp.is_some() || r.http.is_some()) {
-            return Err(format!("{}{}: skip_if_ready needs a `ready` check with tcp or http.", at(e), e.name()));
+        if e.skip_if_ready && e.running_if.is_none() && !e.ready.as_ref().is_some_and(|r| r.tcp.is_some() || r.http.is_some()) {
+            return Err(format!(
+                "{}{}: skip_if_ready needs a `ready` check with tcp or http; for other apps, use \
+                 `running_if = {{ process = \"name\" }}` (or tcp/http).",
+                at(e),
+                e.name()
+            ));
+        }
+        if let Some(r) = &e.running_if {
+            let kinds = [r.tcp.is_some(), r.http.is_some(), r.process.is_some()].iter().filter(|&&b| b).count();
+            if kinds != 1 {
+                return Err(format!("{}{}: `running_if` needs exactly one of tcp, http or process.", at(e), e.name()));
+            }
+            if r.process.as_ref().is_some_and(|p| p.trim().is_empty()) {
+                return Err(format!("{}{}: running_if.process is empty.", at(e), e.name()));
+            }
+            if r.tcp.is_some() || r.http.is_some() {
+                let as_ready = ReadyConfig { tcp: r.tcp.clone(), http: r.http.clone(), log: None, timeout_ms: None };
+                check_ready(e.name(), &as_ready).map_err(|err| format!("{}{}", at(e), err.replace("ready.", "running_if.")))?;
+            }
         }
         if let Some(h) = &e.health {
             if h.tcp.is_some() && h.http.is_some() {
@@ -794,8 +887,15 @@ fn select(
             stack.extend(&deps[i]);
         }
     }
+    let mut held = vec![false; entries.len()];
     for n in &sel.skip {
-        keep[find(&entries, n).map_err(|e| format!("--skip: {e}"))?] = false;
+        let i = find(&entries, n).map_err(|e| format!("--skip: {e}"))?;
+        // A skipped task stays in the host, so `brady-ctl run` can still run it.
+        if entries[i].task {
+            held[i] = true;
+        } else {
+            keep[i] = false;
+        }
     }
     // Renumber the kept entries' dependencies.
     let mut new_index = vec![None; entries.len()];
@@ -813,10 +913,11 @@ fn select(
     let tasks_kept: Vec<usize> = (0..entries.len()).filter(|&i| keep[i] && is_task[i]).collect();
     let mut out_entries = Vec::new();
     let mut out_deps = Vec::new();
-    for (i, e) in entries.into_iter().enumerate() {
+    for (i, mut e) in entries.into_iter().enumerate() {
         if !keep[i] {
             continue;
         }
+        e.held = held[i];
         let mut d: Vec<usize> = if e.task {
             // The task before this one, among those kept.
             tasks_kept.iter().copied().rfind(|&t| t < i).into_iter().collect()
@@ -1150,7 +1251,9 @@ mod tests {
             ..Default::default()
         };
         let l = parse(&text, Path::new("C:\\"), &sel).unwrap();
-        assert_eq!(names(&l), ["solr", "azurite", "api"]);
+        // The skipped task stays, held for `brady-ctl run`.
+        assert_eq!(names(&l), ["build", "solr", "azurite", "api"]);
+        assert!(l.entries[0].held);
         assert_eq!(l.selection.profiles, ["webdev", "quick"]);
         assert_eq!(l.selection.skip, ["web"]);
         let sel = Selection { profiles: vec!["nope".into()], ..Default::default() };
@@ -1197,12 +1300,64 @@ mod tests {
 
     #[test]
     fn skip_drops_apps_and_dependencies_on_them() {
-        let sel = Selection { skip: vec!["worker".into(), "azurite".into(), "build".into()], ..Default::default() };
+        let sel = Selection { skip: vec!["worker".into(), "azurite".into()], ..Default::default() };
         let l = parse(STACK, Path::new("C:\\"), &sel).unwrap();
-        assert_eq!(names(&l), ["solr", "api", "web"]);
-        assert_eq!(l.deps, [vec![], vec![0], vec![]]);
+        assert_eq!(names(&l), ["build", "solr", "api", "web"]);
+        assert_eq!(l.deps, [vec![], vec![0], vec![0, 1], vec![0]]);
+        assert!(l.entries.iter().all(|e| !e.held));
         let sel = Selection { skip: vec!["nope".into()], ..Default::default() };
         assert!(parse(STACK, Path::new("C:\\"), &sel).is_err());
+    }
+
+    #[test]
+    fn a_skipped_task_is_held_not_dropped() {
+        let sel = Selection { skip: vec!["build".into()], ..Default::default() };
+        let l = parse(STACK, Path::new("C:\\"), &sel).unwrap();
+        assert_eq!(names(&l), ["build", "solr", "azurite", "api", "worker", "web"]);
+        assert!(l.entries[0].held && !l.entries[1].held);
+        // Apps still wait for it; a held task counts as done, so they start at once.
+        assert_eq!(l.deps[1], [0]);
+        // Skipping every app still leaves nothing to run.
+        let sel = Selection { only: vec!["web".into()], skip: vec!["web".into()], ..Default::default() };
+        assert!(parse(STACK, Path::new("C:\\"), &sel).is_err());
+    }
+
+    #[test]
+    fn running_if_takes_one_check() {
+        let l = load_str("[[app]]\nname='w'\ncommand='w'\nrunning_if = { process = 'WorkerService' }\n").unwrap();
+        assert_eq!(l.entries[0].running_check().unwrap().process.as_deref(), Some("WorkerService"));
+        let l = load_str("[[app]]\nname='w'\ncommand='w'\nrunning_if = { process = 'bin\\Debug\\w.exe' }\n").unwrap();
+        assert_eq!(l.entries[0].running_if.as_ref().unwrap().process.as_deref(), Some(r"C:\repo\bin\Debug\w.exe"));
+        let l = load_str("[[app]]\nname='w'\ncommand='w'\nrunning_if = { http = 'https://localhost:8000' }\nready = { log = 'x' }\n").unwrap();
+        assert!(l.entries[0].running_check().unwrap().http.is_some());
+        for bad in [
+            "running_if = { tcp = 1, process = 'a' }",
+            "running_if = {}",
+            "running_if = { http = 'localhost' }",
+            "running_if = { process = ' ' }",
+            "running_if = { log = 'x' }",
+        ] {
+            assert!(load_str(&format!("[[app]]\ncommand='w'\n{bad}\n")).is_err(), "{bad}");
+        }
+        // skip_if_ready still works on its own, from a tcp/http `ready`.
+        let l = load_str("[[app]]\ncommand='w'\nskip_if_ready = true\nready = { tcp = 5 }\n").unwrap();
+        assert_eq!(l.entries[0].running_check().unwrap().tcp, Some(TcpTarget::Port(5)));
+        assert!(load_str("[[app]]\ncommand='w'\nready = { tcp = 5 }\n").unwrap().entries[0].running_check().is_none());
+    }
+
+    #[test]
+    fn skip_if_running_borrows_the_apps_checks() {
+        let text = "[[task]]\nname='npm-install'\ncommand='npm i'\nskip_if_running = ['web']\n\
+                    [[app]]\nname='web'\ncommand='n'\nrunning_if = { tcp = 8000 }\n\
+                    [[app]]\nname='api'\ncommand='a'\n";
+        let l = load_str(text).unwrap();
+        assert_eq!(l.entries[0].skip_checks, [("web".to_string(), RunningIf { tcp: Some(TcpTarget::Port(8000)), ..Default::default() })]);
+        // Still checked when the selection leaves the app out.
+        let sel = Selection { skip: vec!["web".into()], ..Default::default() };
+        assert_eq!(parse(text, Path::new("C:\\"), &sel).unwrap().entries[0].skip_checks.len(), 1);
+        let err = load_str(&text.replace("['web']", "['api']")).unwrap_err();
+        assert!(err.contains("api has no way to tell it's running"), "{err}");
+        assert!(load_str(&text.replace("['web']", "['nope']")).unwrap_err().contains("skip_if_running"));
     }
 
     #[test]

@@ -10,30 +10,30 @@ use crate::config::{self, Selection, VERSION};
 use serde_json::{Value, json};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::os::windows::process::CommandExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HWND, LPARAM, SetHandleInformation,
-    WPARAM,
+    WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, PIPE_ACCESS_DUPLEX};
-use windows::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-};
+use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    ConnectNamedPipe, CreatePipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, PostMessageW, WM_APP};
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 /// Posted to the host window: lParam is a `Box<Request>`.
 pub const WM_APP_CONTROL: u32 = WM_APP + 10;
@@ -55,6 +55,9 @@ pub enum Cmd {
     /// Stop these apps (and the task's `stops`), rerun the task, then start the apps
     /// again. Answered once the task has been launched.
     Run { task: String, stop: Vec<String> },
+    /// `up` with another selection: start the apps it adds; with `exact`, stop the
+    /// ones it leaves out.
+    Select { sel: Selection, exact: bool },
 }
 
 pub type Reply = mpsc::Sender<Result<Value, String>>;
@@ -71,7 +74,7 @@ pub const VERBS: [&str; 12] = [
 ];
 
 pub const USAGE: &str = "usage: brady-ctl check [config] [--profile p] [--only a,b] [--skip a,b]
-       brady-ctl up [config] [--profile p] [--only a,b] [--skip a,b] [--timeout secs]
+       brady-ctl up [config] [--profile p] [--only a,b] [--skip a,b] [--exact] [--timeout secs]
        brady-ctl down [config|pid] [--timeout secs]
        brady-ctl status [config|pid]
        brady-ctl wait <app> [config|pid] [--timeout secs]
@@ -217,6 +220,15 @@ fn handle(line: &str, hwnd: isize, helper: &Path) -> Result<Value, String> {
         }
         "quit" => ask_until_done(hwnd, Cmd::Quit),
         "run" => ask_until_done(hwnd, Cmd::Run { task: app, stop: split_list(extra) }),
+        "select" => {
+            // select<TAB>exact<TAB>profiles<TAB>only<TAB>skip
+            let sel = Selection {
+                profiles: split_list(extra),
+                only: split_list(parts.next().unwrap_or("")),
+                skip: split_list(parts.next().unwrap_or("")),
+            };
+            ask(hwnd, Cmd::Select { sel, exact: app == "1" })
+        }
         "tail" => {
             let lines = extra.parse().unwrap_or(40);
             let pids = ask(hwnd, Cmd::ConsolePids(app.clone()))?;
@@ -296,6 +308,7 @@ pub fn client_main(args: &[String]) -> i32 {
 #[derive(Default)]
 struct Opts {
     positional: Vec<String>,
+    exact: bool,
     lines: Option<u32>,
     timeout: Option<Duration>,
     sel: Selection,
@@ -312,7 +325,7 @@ fn allowed(verb: &str) -> &'static [&'static str] {
     match verb {
         "tail" => &["--lines"],
         "events" => &["--lines", "--app"],
-        "up" => &["--profile", "--only", "--skip", "--timeout"],
+        "up" => &["--profile", "--only", "--skip", "--exact", "--timeout"],
         "check" => &["--profile", "--only", "--skip"],
         "down" | "wait" => &["--timeout"],
         "run" => &["--stop", "--timeout"],
@@ -330,6 +343,10 @@ fn parse_opts(verb: &str, args: &[String]) -> Result<Opts, Failure> {
         }
         if !allowed(verb).contains(&a.as_str()) {
             return Err(usage(format!("{verb} doesn't take {a}\n\n{USAGE}")));
+        }
+        if a == "--exact" {
+            o.exact = true;
+            continue;
         }
         let value = it.next().ok_or_else(|| usage(format!("{a} needs a value")))?;
         let number = || value.parse::<u64>().map_err(|_| usage(format!("{a} needs a number")));
@@ -371,7 +388,7 @@ fn client(args: &[String]) -> Result<String, Failure> {
     let timeout = o.timeout.unwrap_or(DEFAULT_TIMEOUT);
     match verb {
         "status" => Ok(pretty(&request(&target_pipe(pos(0))?, &["status"])?)),
-        "up" => up(pos(0), &o.sel, timeout),
+        "up" => up(pos(0), &o.sel, o.exact, timeout),
         "check" => check(pos(0), &o.sel),
         "down" => down(&target_pipe(pos(0))?, timeout),
         "wait" => {
@@ -433,90 +450,256 @@ fn request(pipe: &str, fields: &[&str]) -> Result<Value, Failure> {
     Ok(reply["result"].clone())
 }
 
-/// Start a host for the config unless one is running, then wait for every app.
-fn up(config_arg: Option<&str>, sel: &Selection, timeout: Duration) -> Result<String, Failure> {
+/// Start a host for the config unless one is running, then wait for every app. A host
+/// already running gets this selection: the apps it adds are started, and with `exact`
+/// the ones it leaves out are stopped.
+fn up(config_arg: Option<&str>, sel: &Selection, exact: bool, timeout: Duration) -> Result<String, Failure> {
     let deadline = Instant::now() + timeout;
     let path = config::resolve_path(config_arg.map(PathBuf::from));
     let path = std::path::absolute(&path).unwrap_or(path);
     // Check the config here, where errors can be printed, rather than in the host.
     let loaded = config::load(&path, sel).map_err(|e| (1, e))?;
     let pipe = config_pipe(&path).ok_or_else(|| (1, format!("config {} not found", path.display())))?;
-    let wanted: Vec<String> = loaded.entries.iter().map(|e| e.name().to_lowercase()).collect();
+    let wanted: Vec<String> = loaded.entries.iter().map(|e| e.name().to_string()).collect();
+    let mut notes = Vec::new();
     match request(&pipe, &["status"]) {
         Ok(status) => {
-            let running = app_names(&status);
-            let mut want = wanted.clone();
+            let mut want: Vec<String> = wanted.iter().map(|n| n.to_lowercase()).collect();
             want.sort();
-            if running != want {
-                return Err((
-                    3,
-                    format!(
-                        "a brady-bunch (pid {}) is already running this config with other apps: {} \
-                         (this selection is: {}). Run brady-ctl down first, or pass the same \
-                         --profile/--only/--skip.",
-                        status["host_pid"],
-                        running.join(", "),
-                        want.join(", ")
-                    ),
-                ));
+            let same = app_names(&status) == want && selection_of(&status) == loaded.selection;
+            if !same || exact {
+                let changed = select(&pipe, sel, exact)?;
+                let list = |k: &str| -> Vec<String> {
+                    changed[k].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(String::from).collect()
+                };
+                let (added, stopping) = (list("added"), list("stopping"));
+                if !added.is_empty() {
+                    notes.push(format!("started: {}", added.join(", ")));
+                }
+                for t in list("skipped_tasks") {
+                    notes.push(format!("{t} was skipped when this host started; brady-ctl run {t} runs it"));
+                }
+                if !stopping.is_empty() {
+                    wait_gone(&pipe, &stopping, deadline)?;
+                    notes.push(format!("stopped: {}", stopping.join(", ")));
+                }
             }
         }
         Err((2, _)) => start_host(&path, &loaded.selection, &pipe, deadline)?,
         Err(e) => return Err(e),
     }
-    wait_ready(&pipe, None, deadline.saturating_duration_since(Instant::now()))
+    let ready = wait_ready(&pipe, Some(&wanted), deadline.saturating_duration_since(Instant::now()))?;
+    notes.push(ready);
+    Ok(notes.join("\n"))
+}
+
+/// The selection a status reports.
+fn selection_of(status: &Value) -> Selection {
+    let list = |k: &str| -> Vec<String> {
+        status[k].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(String::from).collect()
+    };
+    Selection { profiles: list("profiles"), only: list("only"), skip: list("skip") }
+}
+
+/// Ask the host to change its selection; the reply says what it started and stops.
+fn select(pipe: &str, sel: &Selection, exact: bool) -> Result<Value, Failure> {
+    let (p, o, k) = (sel.profiles.join(","), sel.only.join(","), sel.skip.join(","));
+    request(pipe, &["select", if exact { "1" } else { "0" }, &p, &o, &k]).map_err(|(code, e)| match code {
+        3 if e.starts_with("unknown request") => (
+            3,
+            "the running host is an older brady-bunch that can't change its apps; \
+             run brady-ctl down first"
+                .to_string(),
+        ),
+        _ => (code, e),
+    })
+}
+
+/// A second launch of the config with another selection (`brady-bunch.exe --skip ...`):
+/// start the apps it adds to the running host.
+pub fn change_selection(config: &Path, sel: &Selection, exact: bool) -> Result<Value, String> {
+    let pipe = config_pipe(config).ok_or_else(|| format!("config {} not found", config.display()))?;
+    select(&pipe, sel, exact).map_err(|(_, e)| e)
+}
+
+/// Wait until none of `names` is listed in the status any more (stopped and dropped
+/// from the selection).
+fn wait_gone(pipe: &str, names: &[String], deadline: Instant) -> Result<(), Failure> {
+    loop {
+        let status = request(pipe, &["status"])?;
+        let left: Vec<&str> =
+            apps(&status).map(name_of).filter(|n| names.iter().any(|m| m.eq_ignore_ascii_case(n))).collect();
+        if left.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err((4, format!("timed out waiting for {} to stop", left.join(", "))));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Launch brady-bunch.exe from this exe's folder and wait for it to answer.
 fn start_host(path: &Path, sel: &Selection, pipe: &str, deadline: Instant) -> Result<(), Failure> {
     let exe = std::env::current_exe().map_err(|e| (1, e.to_string()))?.with_file_name("brady-bunch.exe");
-    // The host outlives this process. If it inherited our stdout or stderr, a caller
-    // capturing our output (`$out = brady-ctl up`, a pipe) would wait for the host to
-    // exit, so make ours non-inheritable first.
-    for std in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        if let Ok(h) = unsafe { GetStdHandle(std) }
-            && !h.is_invalid()
-            && !h.0.is_null()
-        {
-            let _ = unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) };
-        }
-    }
-    let spawn = |flags: u32| {
-        std::process::Command::new(&exe)
-            .arg(path)
-            .args(sel.to_args())
-            // Errors go to stderr (read below) rather than a dialog nobody can see.
-            .arg("--no-dialog")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .creation_flags(flags)
-            .spawn()
-    };
-    // Break away from the caller's job, if it has one, so the host outlives this
-    // command when the job is closed. Not every job allows it.
-    let mut child = spawn(CREATE_BREAKAWAY_FROM_JOB.0)
-        .or_else(|_| spawn(0))
-        .map_err(|e| (1, format!("couldn't start {}: {e}", exe.display())))?;
+    let mut args = vec![path.to_string_lossy().into_owned()];
+    args.extend(sel.to_args());
+    // Errors go to stderr (read below) rather than a dialog nobody can see.
+    args.push("--no-dialog".into());
+    let mut host =
+        HostProcess::spawn(&exe, &args).map_err(|e| (1, format!("couldn't start {}: {}", exe.display(), e.message())))?;
     loop {
         match request(pipe, &["status"]) {
             Ok(_) => return Ok(()),
             Err((2, _)) => {}
             Err(e) => return Err(e),
         }
-        if let Ok(Some(code)) = child.try_wait() {
+        if let Some(code) = host.exit_code() {
             let mut err = String::new();
-            if let Some(mut e) = child.stderr.take() {
-                let _ = e.read_to_string(&mut err);
-            }
+            let _ = host.stderr.read_to_string(&mut err);
             let err = err.trim();
-            return Err((4, format!("brady-bunch exited with code {code} before it started{}{err}", if err.is_empty() { "" } else { ": " })));
+            return Err((
+                4,
+                format!("brady-bunch exited with code {code} before it started{}{err}", if err.is_empty() { "" } else { ": " }),
+            ));
         }
         if Instant::now() >= deadline {
             return Err((4, "timed out waiting for brady-bunch to start".into()));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// A host started by `up`.
+struct HostProcess {
+    process: OwnedHandle,
+    /// The host's stderr, where it says why it couldn't start (`--no-dialog`).
+    stderr: File,
+}
+
+impl HostProcess {
+    /// Start `exe` with stdin and stdout on NUL, stderr on a pipe back to us, and no
+    /// other handles. The host outlives this process: if it inherited anything else of
+    /// ours (our stdout, or a handle we inherited from our own caller), a caller reading
+    /// our output to end-of-file would wait for the host to exit.
+    fn spawn(exe: &Path, args: &[String]) -> windows::core::Result<HostProcess> {
+        unsafe {
+            let inherit = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                bInheritHandle: true.into(),
+                ..Default::default()
+            };
+            let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
+            CreatePipe(&mut read, &mut write, Some(&inherit), 0)?;
+            let stderr = File::from_raw_handle(read.0);
+            let write = OwnedHandle::from_raw_handle(write.0);
+            SetHandleInformation(HANDLE(stderr.as_raw_handle()), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))?;
+            let nul = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("NUL")
+                .map_err(|e| windows::core::Error::new(windows::core::HRESULT(e.raw_os_error().unwrap_or(1)), "NUL"))?;
+            let nul_h = HANDLE(nul.as_raw_handle());
+            SetHandleInformation(nul_h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)?;
+            let write_h = HANDLE(write.as_raw_handle());
+
+            // Inherit exactly these, whatever else is inheritable in this process.
+            let handles = [nul_h, write_h];
+            let mut size = 0usize;
+            let _ = InitializeProcThreadAttributeList(None, 1, None, &mut size);
+            let mut buf = vec![0u8; size];
+            let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr().cast());
+            InitializeProcThreadAttributeList(Some(list), 1, None, &mut size)?;
+            let created = (|| -> windows::core::Result<OwnedHandle> {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    Some(handles.as_ptr().cast()),
+                    size_of_val(&handles),
+                    None,
+                    None,
+                )?;
+                let mut si = STARTUPINFOEXW::default();
+                si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+                si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                si.StartupInfo.hStdInput = nul_h;
+                si.StartupInfo.hStdOutput = nul_h;
+                si.StartupInfo.hStdError = write_h;
+                si.lpAttributeList = list;
+                let exe_w = HSTRING::from(exe.as_os_str());
+                let line: Vec<String> =
+                    std::iter::once(exe.to_string_lossy().into_owned()).chain(args.iter().cloned()).map(|a| quote_arg(&a)).collect();
+                let mut line: Vec<u16> = line.join(" ").encode_utf16().chain(Some(0)).collect();
+                let mut pi = PROCESS_INFORMATION::default();
+                // Break away from the caller's job, if it has one, so the host outlives
+                // this command when the job is closed. Not every job allows it.
+                let mut result = Ok(());
+                for flags in [EXTENDED_STARTUPINFO_PRESENT | CREATE_BREAKAWAY_FROM_JOB, EXTENDED_STARTUPINFO_PRESENT] {
+                    result = CreateProcessW(
+                        PCWSTR(exe_w.as_ptr()),
+                        Some(PWSTR(line.as_mut_ptr())),
+                        None,
+                        None,
+                        true,
+                        flags,
+                        None,
+                        None,
+                        &si.StartupInfo,
+                        &mut pi,
+                    );
+                    if result.is_ok() {
+                        break;
+                    }
+                }
+                result?;
+                let _ = CloseHandle(pi.hThread);
+                Ok(OwnedHandle::from_raw_handle(pi.hProcess.0))
+            })();
+            DeleteProcThreadAttributeList(list);
+            // `write` and `nul` close here, so the host has the only write end of the pipe.
+            Ok(HostProcess { process: created?, stderr })
+        }
+    }
+
+    fn exit_code(&self) -> Option<u32> {
+        let h = HANDLE(self.process.as_raw_handle());
+        unsafe {
+            if WaitForSingleObject(h, 0) != WAIT_OBJECT_0 {
+                return None;
+            }
+            let mut code = 0;
+            GetExitCodeProcess(h, &mut code).ok()?;
+            Some(code)
+        }
+    }
+}
+
+/// Quote one argument for a Windows command line, by the rules CommandLineToArgvW reads.
+fn quote_arg(a: &str) -> String {
+    if !a.is_empty() && !a.contains([' ', '\t', '"']) {
+        return a.to_string();
+    }
+    let mut out = String::from('"');
+    let mut slashes = 0;
+    for c in a.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            c => {
+                out.push_str(&"\\".repeat(slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
 }
 
 /// Validate a config the way a launch would, without launching anything.
@@ -666,6 +849,11 @@ fn wait_run(pipe: &str, task: &str, restarting: &[String], start: Instant, timeo
         if task_done.is_none() {
             match t["state"].as_str().unwrap_or("") {
                 "done" => task_done = Some(secs),
+                "skipped" => {
+                    let why = t["reason"].as_str().unwrap_or("skipped");
+                    let why = why.split("; brady-ctl run").next().unwrap_or(why);
+                    return Ok(format!("{task}: skipped ({why}); nothing was restarted"));
+                }
                 "exited" | "failed" | "stopped" => {
                     println!("{}", pretty(&status));
                     let left = if restarting.is_empty() {
@@ -880,6 +1068,26 @@ fn attach_output() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_arg_round_trips_through_the_command_line_rules() {
+        assert_eq!(quote_arg("plain"), "plain");
+        assert_eq!(quote_arg(""), "\"\"");
+        assert_eq!(quote_arg(r"C:\my configs\brady.toml"), r#""C:\my configs\brady.toml""#);
+        assert_eq!(quote_arg(r"C:\dir with space\"), r#""C:\dir with space\\""#);
+        assert_eq!(quote_arg(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quote_arg(r#"a\"b"#), r#""a\\\"b""#);
+    }
+
+    #[test]
+    fn up_takes_exact_as_a_flag() {
+        let args: Vec<String> = ["cfg.toml", "--exact", "--skip", "worker"].iter().map(|s| s.to_string()).collect();
+        let o = parse_opts("up", &args).unwrap();
+        assert!(o.exact);
+        assert_eq!(o.positional, ["cfg.toml"]);
+        assert_eq!(o.sel.skip, ["worker"]);
+        assert!(parse_opts("run", &["--exact".to_string()]).is_err());
+    }
 
     #[test]
     fn config_pipe_ignores_case_and_relative_spelling() {
