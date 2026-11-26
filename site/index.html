@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>brady-bunch: your whole dev stack, one tiled window</title>
+<meta name="description" content="brady-bunch launches a set of Windows programs, tiles their windows in one host window, starts them in order and shuts them down cleanly.">
+<meta property="og:title" content="brady-bunch">
+<meta property="og:description" content="Your whole dev stack, one tiled window. For Windows.">
+<meta property="og:image" content="https://rycole.com/brady-bunch/assets/banner.png">
+<link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@500;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #3b2416; --bg-2: #2f1c11; --ink: #2a1a10; --cream: #f6ead6; --cream-2: #eadbc2;
+    --muted: #c9b79c; --orange: #e8772e; --mustard: #f2b33d; --teal: #2a9d8f;
+    --avocado: #8f9c3a; --rust: #c4512b; --sky: #5fa8c9; --pink: #e58f8a; --plum: #8e5a8b;
+    --text-dark: #3b2416; --text-dark-2: #6b4a33;
+    --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+    --display: Rubik, "Segoe UI", system-ui, sans-serif;
+    --body: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--cream); font: 17px/1.6 var(--body); -webkit-font-smoothing: antialiased; }
+  a { color: inherit; }
+  code { font-family: var(--mono); font-size: .9em; }
+  .wrap { max-width: 1160px; margin: 0 auto; padding: 0 24px; }
+  .stripes { display: flex; gap: 8px; }
+  .stripes span { width: 34px; height: 8px; border-radius: 4px; }
+
+  /* nav */
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; gap: 16px; }
+  .brand { display: flex; align-items: center; gap: 12px; text-decoration: none; font: 800 22px var(--display); letter-spacing: -.5px; }
+  .brand img { width: 38px; height: 38px; }
+  .brand b { color: var(--orange); }
+  .navlinks { display: flex; gap: 24px; font-weight: 600; font-size: 15px; }
+  .navlinks a { text-decoration: none; color: var(--muted); }
+  .navlinks a:hover { color: var(--cream); }
+
+  /* hero */
+  .hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 56px; align-items: center; padding: 48px 0 88px; }
+  h1 { font: 800 clamp(40px, 5.4vw, 64px)/1.04 var(--display); letter-spacing: -1.5px; margin: 0 0 20px; }
+  h1 em { font-style: normal; color: var(--mustard); }
+  .lede { font-size: 19px; color: var(--cream-2); margin: 0 0 28px; max-width: 30em; }
+  .install { display: flex; align-items: center; background: var(--ink); border-radius: 12px; padding: 6px 6px 6px 18px; gap: 12px; max-width: 100%; border: 1px solid #ffffff14; }
+  .install code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; color: var(--cream); font-size: 14px; padding: 10px 0; scrollbar-width: none; }
+  .install code::-webkit-scrollbar { display: none; }
+  .install .p { color: var(--mustard); user-select: none; }
+  .copy { flex: none; border: 0; border-radius: 8px; background: var(--orange); color: var(--ink); font: 700 14px var(--body); padding: 10px 14px; cursor: pointer; }
+  .copy:hover { background: var(--mustard); }
+  .ctas { display: flex; gap: 14px; margin-top: 22px; flex-wrap: wrap; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; text-decoration: none; font-weight: 700; padding: 12px 20px; border-radius: 10px; border: 2px solid var(--cream); }
+  .btn.solid { background: var(--cream); color: var(--ink); }
+  .btn:hover { border-color: var(--mustard); }
+  .btn.solid:hover { background: var(--mustard); }
+  .note { font-size: 14px; color: var(--muted); margin-top: 14px; }
+
+  /* mock host window */
+  .host { background: #1d120b; border-radius: 16px; box-shadow: 0 30px 60px #0007, 0 0 0 1px #ffffff12; overflow: hidden; }
+  .host-bar { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #24160d; font: 600 13px var(--body); color: var(--muted); }
+  .host-bar .ctl { display: flex; gap: 14px; font-size: 13px; letter-spacing: 2px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 6px; }
+  .tile { border-radius: 8px; overflow: hidden; background: var(--ink); display: flex; flex-direction: column; min-width: 0; aspect-ratio: 4 / 3.1; transition: box-shadow .3s; }
+  .tile header { display: flex; align-items: center; gap: 6px; padding: 5px 8px; font: 600 11.5px var(--body); color: var(--ink); white-space: nowrap; transition: background .4s; }
+  .tile header .name { font-weight: 800; }
+  .tile header .state { margin-left: auto; opacity: .8; overflow: hidden; text-overflow: ellipsis; }
+  .tile .con { flex: 1; padding: 6px 8px; font: 10.5px/1.45 var(--mono); color: var(--cream-2); overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
+  .tile .con div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile .con .ok { color: #9fd9a0; }
+  .tile .con .dim { color: #8d7a62; }
+  .tile.waiting header { background: #6b5847 !important; color: var(--cream-2); }
+  .tile.waiting .con { opacity: .45; }
+
+  /* sections */
+  section { padding: 88px 0; }
+  .light { background: var(--cream); color: var(--text-dark); }
+  .eyebrow { font: 700 13px var(--body); text-transform: uppercase; letter-spacing: 2px; color: var(--orange); margin: 0 0 10px; }
+  h2 { font: 800 clamp(30px, 3.6vw, 44px)/1.1 var(--display); letter-spacing: -1px; margin: 0 0 16px; }
+  .sub { font-size: 18px; max-width: 40em; margin: 0 0 44px; color: var(--text-dark-2); }
+  .dark .sub, .final .sub { color: var(--cream-2); }
+  .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  .card { background: #fff8ec; border-radius: 16px; padding: 24px; border-top: 8px solid var(--c); box-shadow: 0 1px 0 #3b24160f; }
+  .card h3 { font: 700 20px var(--display); margin: 0 0 8px; }
+  .card p { margin: 0; color: var(--text-dark-2); font-size: 16px; }
+  .card code { background: #3b241612; padding: 1px 5px; border-radius: 4px; }
+
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; align-items: start; }
+  pre { margin: 0; background: var(--ink); color: var(--cream); border-radius: 14px; padding: 22px 24px; overflow-x: auto; font: 13.5px/1.6 var(--mono); border: 1px solid #ffffff10; }
+  .k { color: var(--sky); } .s { color: #9fd9a0; } .h { color: var(--mustard); font-weight: 600; } .c { color: #8d7a62; } .pr { color: var(--orange); }
+  .steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 22px; }
+  .steps li { display: grid; grid-template-columns: 44px 1fr; gap: 14px; }
+  .steps .n { width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; font: 800 20px var(--display); color: var(--ink); }
+  .steps h3 { font: 700 19px var(--display); margin: 2px 0 4px; }
+  .steps p { margin: 0; color: var(--text-dark-2); }
+  .steps code { background: #3b241612; padding: 1px 5px; border-radius: 4px; }
+  .dark .steps p { color: var(--cream-2); }
+  .dark .steps code { background: #ffffff14; }
+
+  .final { text-align: center; padding: 96px 0; }
+  .final .install { max-width: 640px; margin: 28px auto 0; text-align: left; }
+  .final .ctas { justify-content: center; }
+  footer { border-top: 1px solid #ffffff14; padding: 28px 0 40px; color: var(--muted); font-size: 14px; }
+  footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; align-items: center; }
+  footer a { color: var(--cream-2); }
+
+  @media (max-width: 900px) {
+    .hero, .split { grid-template-columns: minmax(0, 1fr); }
+    .hero { gap: 40px; padding-top: 24px; }
+    .features { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 600px) {
+    .wrap { padding: 0 16px; }
+    .navlinks { gap: 16px; font-size: 14px; }
+    .navlinks .hide-sm { display: none; }
+    .features { grid-template-columns: 1fr; }
+    section { padding: 64px 0; }
+    .tile .con { font-size: 8.5px; padding: 4px 5px; }
+    .tile header { font-size: 9.5px; padding: 4px 5px; }
+    .tile header .state { display: none; }
+    pre { font-size: 12px; padding: 18px; }
+  }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<div style="background:var(--bg)">
+  <div class="wrap">
+    <nav>
+      <a class="brand" href="./"><img src="assets/logo.svg" alt=""><span>brady<b>-</b>bunch</span></a>
+      <div class="navlinks">
+        <a href="https://github.com/ryancole/brady-bunch/wiki">Docs</a>
+        <a class="hide-sm" href="https://github.com/ryancole/brady-bunch/releases">Releases</a>
+        <a href="https://github.com/ryancole/brady-bunch">GitHub</a>
+      </div>
+    </nav>
+
+    <div class="hero">
+      <div>
+        <h1>Your whole dev stack.<br><em>One tiled window.</em></h1>
+        <p class="lede">brady-bunch starts your servers, watchers and consoles in the right order, tiles them all in one window, and shuts them down cleanly when you close it. For Windows.</p>
+        <div class="install">
+          <code><span class="p">PS&gt; </span><span id="cmd1">irm https://github.com/ryancole/brady-bunch/releases/latest/download/install.ps1 | iex</span></code>
+          <button class="copy" data-copy="cmd1">Copy</button>
+        </div>
+        <div class="ctas">
+          <a class="btn solid" href="https://github.com/ryancole/brady-bunch/wiki/Getting-Started">Get started</a>
+          <a class="btn" href="https://github.com/ryancole/brady-bunch">View on GitHub</a>
+        </div>
+        <p class="note">Free and open source. No dependencies: three small exes.</p>
+      </div>
+
+      <div class="host" aria-label="Animated example of the brady-bunch window starting a stack">
+        <div class="host-bar"><span>my stack</span><span class="ctl">&#x2013; &#x25A1; &#x2715;</span></div>
+        <div class="grid" id="grid"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<section class="light" id="features">
+  <div class="wrap">
+    <p class="eyebrow">What it does</p>
+    <h2>Stop juggling six terminals.</h2>
+    <p class="sub">Describe your stack once in a <code>brady.toml</code>. From then on, one command brings it all up, and one click takes it all down.</p>
+    <div class="features">
+      <div class="card" style="--c:var(--orange)"><h3>Everything in one window</h3><p>Console and GUI apps are embedded side by side in a grid. Click a tile to type into it; double-click its header to zoom.</p></div>
+      <div class="card" style="--c:var(--teal)"><h3>Starts in the right order</h3><p>An app can wait until another is listening on a port, answering HTTP, or has printed a line, with <code>depends_on</code> and <code>ready</code>.</p></div>
+      <div class="card" style="--c:var(--mustard)"><h3>Builds first</h3><p>Tasks like <code>dotnet build</code> or <code>npm ci</code> run before anything starts. A failed build stays on screen; fix it and press Enter.</p></div>
+      <div class="card" style="--c:var(--avocado)"><h3>Shuts down gracefully</h3><p>Closing the window sends each app Ctrl+C, in reverse dependency order, and only kills what's left after a timeout. Nothing is orphaned.</p></div>
+      <div class="card" style="--c:var(--rust)"><h3>Scriptable</h3><p><code>brady-ctl up</code> returns once the stack is ready. Check status as JSON, restart one app, or rebuild while the rest keeps running.</p></div>
+      <div class="card" style="--c:var(--sky)"><h3>Notices crashes</h3><p>A crashed app's tile turns red and the taskbar flashes. Its console stays open with the last output. Restart it automatically, or with a keypress.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="dark">
+  <div class="wrap split">
+    <div>
+      <p class="eyebrow">Configure</p>
+      <h2>One small file.</h2>
+      <p class="sub">A task, three apps, and the order they need. <code>brady-ctl check</code> validates it, down to whether every exe can be found.</p>
+      <ol class="steps">
+        <li><span class="n" style="background:var(--mustard)">1</span><div><h3>Build</h3><p>The <code>build</code> task runs to completion before any app starts.</p></div></li>
+        <li><span class="n" style="background:var(--teal)">2</span><div><h3>Wait for what you need</h3><p><code>api</code> starts once <code>db</code> accepts connections on port 5432.</p></div></li>
+        <li><span class="n" style="background:var(--orange)">3</span><div><h3>Close to stop</h3><p>Apps get Ctrl+C one at a time, dependents first: <code>api</code> stops before <code>db</code>.</p></div></li>
+      </ol>
+    </div>
+<pre><span class="c"># brady.toml</span>
+<span class="k">title</span> = <span class="s">"my stack"</span>
+
+<span class="h">[[task]]</span>
+<span class="k">name</span> = <span class="s">"build"</span>
+<span class="k">command</span> = <span class="s">'dotnet build src\App.sln'</span>
+
+<span class="h">[[app]]</span>
+<span class="k">name</span> = <span class="s">"db"</span>
+<span class="k">command</span> = <span class="s">'C:\tools\db\db.exe --port 5432'</span>
+<span class="k">ready</span> = { <span class="k">tcp</span> = 5432 }
+
+<span class="h">[[app]]</span>
+<span class="k">name</span> = <span class="s">"api"</span>
+<span class="k">command</span> = <span class="s">'dotnet run --no-build --project src\Api'</span>
+<span class="k">depends_on</span> = [<span class="s">"db"</span>]
+<span class="k">ready</span> = { <span class="k">http</span> = <span class="s">"https://localhost:8002/health"</span> }
+<span class="k">exit_with</span> = <span class="s">"main"</span>
+
+<span class="h">[[app]]</span>
+<span class="k">name</span> = <span class="s">"web"</span>
+<span class="k">command</span> = <span class="s">'cmd /c npm start'</span>
+<span class="k">cwd</span> = <span class="s">'web'</span></pre>
+  </div>
+</section>
+
+<section class="light">
+  <div class="wrap split">
+<pre><span class="pr">PS&gt;</span> brady-ctl up
+ready: build, db, api, web (12.3s)
+
+<span class="pr">PS&gt;</span> brady-ctl restart api; brady-ctl wait api
+ready: db, api (3.1s)
+
+<span class="pr">PS&gt;</span> brady-ctl run build
+build: done (8.4s); restarted api; ready (14.8s)
+
+<span class="pr">PS&gt;</span> brady-ctl tail api --lines 3
+info: Microsoft.Hosting.Lifetime[14]
+      Now listening on: https://localhost:8002
+info: Application started.
+
+<span class="pr">PS&gt;</span> brady-ctl down
+api: stopped by ctrl-c after 1834 ms
+web: stopped by ctrl-c after 412 ms
+db: stopped by ctrl-c after 96 ms</pre>
+    <div>
+      <p class="eyebrow">Control</p>
+      <h2>Drive it from a script.</h2>
+      <p class="sub">No more start-and-poll loops. <code>brady-ctl</code> waits for you and tells you what happened.</p>
+      <ol class="steps">
+        <li><span class="n" style="background:var(--teal)">&#x25B6;</span><div><h3><code>up</code> / <code>down</code></h3><p>Start the stack and return once it's ready, or stop it and return once it's gone. Exit code 4 and a reason if anything fails.</p></div></li>
+        <li><span class="n" style="background:var(--orange)">&#x21BB;</span><div><h3><code>run build</code></h3><p>Rebuild while the stack runs: it stops the apps that lock the output, builds, and starts them again.</p></div></li>
+        <li><span class="n" style="background:var(--plum);color:var(--cream)">{ }</span><div><h3><code>status</code></h3><p>Every app's state as JSON, for tests, CI and coding agents.</p></div></li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<div class="final">
+  <div class="wrap">
+    <div class="stripes" style="justify-content:center;margin-bottom:28px">
+      <span style="background:var(--orange)"></span><span style="background:var(--mustard)"></span><span style="background:var(--teal)"></span><span style="background:var(--avocado)"></span><span style="background:var(--rust)"></span><span style="background:var(--sky)"></span><span style="background:var(--pink)"></span><span style="background:var(--plum)"></span>
+    </div>
+    <h2>Here's the story of a dev stack&hellip;</h2>
+    <p class="sub" style="margin:0 auto">&hellip;that was all in one window. Install it in one line.</p>
+    <div class="install">
+      <code><span class="p">PS&gt; </span><span id="cmd2">irm https://github.com/ryancole/brady-bunch/releases/latest/download/install.ps1 | iex</span></code>
+      <button class="copy" data-copy="cmd2">Copy</button>
+    </div>
+    <div class="ctas">
+      <a class="btn solid" href="https://github.com/ryancole/brady-bunch/wiki">Read the docs</a>
+      <a class="btn" href="https://github.com/ryancole/brady-bunch/releases">Download the zip</a>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <div class="wrap">
+    <span>brady-bunch is open source on <a href="https://github.com/ryancole/brady-bunch">GitHub</a>.</span>
+    <span><a href="https://github.com/ryancole/brady-bunch/wiki">Docs</a> &middot; <a href="https://github.com/ryancole/brady-bunch/blob/master/CHANGELOG.md">Changelog</a> &middot; <a href="https://github.com/ryancole/brady-bunch/issues">Issues</a></span>
+  </div>
+</footer>
+
+<script>
+// Copy buttons
+document.querySelectorAll('.copy').forEach(b => b.addEventListener('click', async () => {
+  const text = document.getElementById(b.dataset.copy).textContent;
+  try { await navigator.clipboard.writeText(text); b.textContent = 'Copied'; }
+  catch { b.textContent = 'Press Ctrl+C'; getSelection().selectAllChildren(document.getElementById(b.dataset.copy)); }
+  setTimeout(() => b.textContent = 'Copy', 1800);
+}));
+
+// Animated host window: a stack starting up in dependency order.
+const apps = [
+  { id: 'build',  color: 'var(--mustard)' },
+  { id: 'db',     color: 'var(--teal)' },
+  { id: 'api',    color: 'var(--orange)' },
+  { id: 'worker', color: 'var(--avocado)' },
+  { id: 'web',    color: 'var(--sky)' },
+  { id: 'shell',  color: 'var(--pink)' },
+  { id: 'solr',   color: 'var(--rust)' },
+  { id: 'redis',  color: 'var(--plum)' },
+  { id: 'logs',   color: 'var(--cream-2)' },
+];
+const grid = document.getElementById('grid');
+const el = {};
+for (const a of apps) {
+  const t = document.createElement('div');
+  t.className = 'tile';
+  t.innerHTML = `<header style="background:${a.color}"><span class="name">${a.id}</span><span class="state"></span></header><div class="con"></div>`;
+  grid.appendChild(t);
+  el[a.id] = { tile: t, state: t.querySelector('.state'), con: t.querySelector('.con') };
+}
+const state = (id, s, waiting = false) => { el[id].state.textContent = s; el[id].tile.classList.toggle('waiting', waiting); };
+const line = (id, s, cls = '') => {
+  const d = document.createElement('div'); d.textContent = s; if (cls) d.className = cls;
+  const c = el[id].con; c.appendChild(d); while (c.children.length > 9) c.firstChild.remove();
+};
+const pid = () => 'pid ' + (1000 + Math.floor(Math.random() * 9000));
+
+const script = [
+  [0, () => {
+    for (const a of apps) { el[a.id].con.innerHTML = ''; state(a.id, 'waiting for build…', true); }
+    state('build', 'running'); line('build', 'PS> dotnet build src\\App.sln', 'dim');
+  }],
+  [500, () => line('build', '  Determining projects to restore...')],
+  [500, () => line('build', '  All projects are up-to-date.')],
+  [500, () => line('build', '  App.Core -> bin\\Debug\\App.Core.dll')],
+  [500, () => line('build', '  App.Api -> bin\\Debug\\App.Api.dll')],
+  [500, () => line('build', '  App.Worker -> bin\\Debug\\Worker.dll')],
+  [450, () => { line('build', 'Build succeeded.', 'ok'); line('build', '    0 Warning(s)  0 Error(s)'); state('build', 'done'); }],
+  [500, () => {
+    for (const id of ['db', 'web', 'shell', 'solr', 'redis', 'logs']) state(id, 'starting…');
+    state('api', 'waiting for db…', true); state('worker', 'waiting for api…', true);
+    line('db', 'db 14.2 starting on port 5432', 'dim');
+    line('web', '> web@1.0.0 start', 'dim'); line('web', '> vite');
+    line('shell', 'PS C:\\src\\app>');
+    line('solr', 'Starting Solr on port 8983');
+    line('redis', '* Server initialized');
+    line('logs', 'tailing logs\\app.log', 'dim');
+  }],
+  [500, () => { line('redis', '* Ready to accept connections tcp', 'ok'); state('redis', pid()); line('solr', 'o.e.j.s.Server Started', 'dim'); }],
+  [450, () => { line('db', 'database system is ready', 'ok'); line('db', 'listening on 0.0.0.0:5432'); state('db', pid()); line('web', '  VITE v5.4  ready in 612 ms', 'ok'); }],
+  [350, () => { state('api', 'starting…'); line('api', 'PS> dotnet run --no-build', 'dim'); line('web', '  ➜  Local: http://localhost:5173/'); state('web', pid()); state('shell', pid()); }],
+  [450, () => { line('api', 'info: Connected to db'); line('logs', '12:01:07 INF host started'); line('solr', 'SolrCore [products] registered', 'ok'); state('solr', pid()); }],
+  [500, () => { line('api', 'Now listening on: https://localhost:8002', 'ok'); line('api', 'Application started.'); state('api', pid()); state('logs', pid()); }],
+  [350, () => { state('worker', 'starting…'); line('worker', 'PS> dotnet run --no-build', 'dim'); line('logs', '12:01:08 INF GET /health 200'); }],
+  [550, () => { line('worker', 'info: Worker running at 12:01:09', 'ok'); line('worker', 'info: polling queue "orders"'); state('worker', pid()); }],
+  [700, () => { line('logs', '12:01:09 INF worker connected'); line('api', 'GET /health 200 3ms'); line('shell', 'PS C:\\src\\app> git status', 'dim'); }],
+  [700, () => { line('shell', 'On branch main'); line('worker', 'info: processed order #4211'); line('logs', '12:01:11 INF order #4211 done'); }],
+  [900, () => { line('api', 'POST /orders 201 18ms'); line('web', '  hmr update /src/App.tsx'); line('worker', 'info: processed order #4212'); }],
+  [900, () => { line('logs', '12:01:13 INF order #4212 done'); line('redis', '* 1 changes in 60 seconds. Saving...'); }],
+  [3200, () => {}],
+];
+
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+if (reduce) { script.forEach(([, f]) => f()); }
+else {
+  let i = 0;
+  const step = () => { script[i][1](); i = (i + 1) % script.length; setTimeout(step, script[i][0] || 600); };
+  step();
+}
+</script>
+</body>
+</html>
