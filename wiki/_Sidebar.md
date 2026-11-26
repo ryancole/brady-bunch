@@ -1,3 +1,5 @@
+[<img src="https://raw.githubusercontent.com/ryancole/brady-bunch/master/assets/logo.svg" width="120" alt="brady-bunch logo">](Home)
+
 **[Home](Home)**
 
 **Start here**

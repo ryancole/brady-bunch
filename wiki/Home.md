@@ -1,5 +1,7 @@
 # brady-bunch
 
+![brady-bunch: all your apps, one tiled window](https://raw.githubusercontent.com/ryancole/brady-bunch/master/assets/banner.svg)
+
 brady-bunch runs a set of Windows programs as one unit. It starts them all, tiles their windows in a grid inside one host window, and stops them all cleanly when you close that window.
 
 It's built for the everyday "I need six terminals open to work on this project" problem: a database, an API, a web dev server, a worker, a log tail. You describe them once in a `brady.toml` file, and from then on one command (or a double-click) brings the whole stack up in the right order.
