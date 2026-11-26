@@ -2,79 +2,109 @@
 
 ![brady-bunch: all your apps, one tiled window](assets/banner.svg)
 
-Launches a list of programs as child processes and tiles their windows inside one host window. Apps can wait for each other to be ready, setup tasks can run first, and closing the host shuts everything down cleanly.
+Run your whole dev stack in one window. brady-bunch starts a list of Windows programs (servers, watchers, consoles, GUI tools), tiles their windows in a grid inside one host window, and stops them all cleanly when you close it.
 
-```
-brady-bunch.exe [config.toml] [--profile name] [--only app,app] [--skip app,app] [--new-instance] [--no-dialog]
-brady-ctl check|up|down|status|wait|start|stop|restart|run|tail|events ...
-```
+- **One window, every app.** Console and GUI apps are embedded side by side. Click a tile to type into it; double-click its header to zoom it.
+- **Starts things in order.** An app can wait until another is listening on a port, answering HTTP, or has printed a line in its output.
+- **Builds first.** Setup tasks such as `dotnet build` or `npm ci` run before any app starts, and a failed build stays on screen.
+- **Shuts down gracefully.** Closing the window sends each app Ctrl+C (or a close message), in reverse dependency order, and only kills what's left after a timeout. Even if the host crashes, Windows cleans up every child process.
+- **Scriptable.** `brady-ctl up` starts the stack and returns once it's ready; `brady-ctl down` stops it.
 
-The config defaults to `brady.toml` in the working directory, or next to the exe if there isn't one there. Relative paths in it are relative to the config file's folder. See [brady.example.toml](brady.example.toml), and [docs/AGENTS.md](docs/AGENTS.md) for the full reference.
+📖 **Full documentation is in the [wiki](https://github.com/ryancole/brady-bunch/wiki).**
 
 ## Install
+
+In PowerShell:
 
 ```powershell
 irm https://github.com/ryancole/brady-bunch/releases/latest/download/install.ps1 | iex
 ```
 
-[install.ps1](install.ps1) downloads the latest release, checks its SHA-256, installs it into `%LOCALAPPDATA%\Programs\brady-bunch` and adds that folder to your user PATH. Run it again to update; it refuses while brady-bunch is running from that folder. It takes `-Version 0.6.0`, `-InstallDir`, `-NoPath` and `-Check` when run as a script block: `& ([scriptblock]::Create((irm <url>))) -Check`. `-Config brady.toml` installs what that config's `min_version` needs, and nothing if the installed version already meets it.
+This installs brady-bunch into `%LOCALAPPDATA%\Programs\brady-bunch` and adds it to your PATH. Run it again to update.
 
-Or download the zip from [Releases](https://github.com/ryancole/brady-bunch/releases) and extract it anywhere. Either way, copy `brady.example.toml` to `brady.toml` (or write your own config). Keep the three exes together:
+Or download the zip from [Releases](https://github.com/ryancole/brady-bunch/releases) and extract it anywhere, keeping its three exes together. See [Installation](https://github.com/ryancole/brady-bunch/wiki/Installation) for options such as pinning a version.
 
-- `brady-bunch.exe`: the host window.
-- `brady-shim.exe`: runs each console app inside its console. Without it, console apps still run, but `log`, `ready.log`, QuickEdit control, kept-open consoles and exact command-line quoting don't work.
-- `brady-ctl.exe`: command-line control of a running host.
+## Quick start
 
-No other dependencies. The zip also includes `AGENTS.md` ([docs/AGENTS.md](docs/AGENTS.md)), a usage guide for AI agents.
+Create a `brady.toml` in your project folder:
 
-To publish a release, bump `version` in `Cargo.toml`, rename the `[Unreleased]` section of [CHANGELOG.md](CHANGELOG.md) to that version, commit, then push a matching tag. The release fails if the changelog has no section for the version, and that section becomes the release notes.
+```toml
+title = "my stack"
+
+[[task]]
+name = "build"
+command = 'dotnet build src\App.sln -nodeReuse:false'
+
+[[app]]
+name = "db"
+command = 'C:\tools\db\db.exe --port 5432'
+ready = { tcp = 5432 }
+
+[[app]]
+name = "api"
+command = 'dotnet run --no-build --project src\Api'
+depends_on = ["db"]
+ready = { http = "https://localhost:8002/health" }
+exit_with = "main"
+url = "https://localhost:8002"
+
+[[app]]
+name = "web"
+command = 'cmd /c npm start'
+cwd = 'web'
+```
+
+Check it, then start it:
+
+```powershell
+brady-ctl check
+brady-bunch
+```
+
+The build runs first, then `db` and `web` start, and `api` waits until the database accepts connections. Close the window to stop everything.
+
+[Getting Started](https://github.com/ryancole/brady-bunch/wiki/Getting-Started) walks through this step by step, and [brady.example.toml](brady.example.toml) lists every setting.
+
+## Command line
 
 ```
-git tag v0.1.0
-git push origin v0.1.0
+brady-bunch [config.toml] [--profile name] [--only app,app] [--skip app,app]
 ```
 
-## Behaviour
+The config defaults to `brady.toml` in the current folder. `--only` and `--skip` run part of a config; `--profile` uses a named selection from it.
 
-- **Launch:** each app runs in its own job object set to kill on close. If the host crashes or is force-killed, Windows kills every child and grandchild.
-- **Console apps:** detected from the exe's PE header, or set with `console = true`. They run under an explicit `conhost.exe` so they get an embeddable console window even when Windows Terminal is the default terminal. Inside it, `brady-shim.exe` starts the command exactly as written and turns off QuickEdit, so a click on the tile can't freeze the app.
-- **Exited console apps** keep their console open, showing the last output and exit code. Press Enter in it to run the app again.
-- **Startup order:** `depends_on = ["db"]` holds an app until `db` is ready. `ready = { tcp = 10000 }`, `{ http = "https://localhost:8002" }` or `{ log = 'regex' }` says when an app counts as ready; without it, an app is ready as soon as it's launched. Waiting tiles show `waiting for db…`.
-- **Tasks:** `[[task]]` entries run one at a time, each to completion, before any app starts. Their progress is shown in a tile that disappears once they've all succeeded. A failed task stops the startup and stays on screen.
-- **Already running:** `running_if = { process = "MyWorker" }` (or `tcp`/`http`) checks whether an app is already running elsewhere before launching it; if so it isn't launched and shows `already running`. `skip_if_ready = true` does the same with the app's tcp/http `ready` check. A task's `skip_if_running = ["web"]` skips the task while that app runs elsewhere.
-- **Environment:** `%VAR%` in `command`, `cwd`, `env`, `log`, `url`, `ready` and `health` is expanded from the app's `env` and the host's environment. `path_prepend = ['C:\dir1', 'C:\dir2']` and `path_append` add folders to the app's PATH, skipping ones that don't exist.
-- **Shared settings:** a `[defaults]` table sets keys for every `[[app]]`. `--only`/`--skip` pick apps from the command line; `--only` brings in what they depend on. A skipped task isn't run at startup but stays available to `brady-ctl run`. A `[profiles]` table names selections, e.g. `webdev = { skip = ["worker"] }`, used as `--profile webdev`.
-- **Version check:** `min_version = "0.7.0"` makes an older brady-bunch refuse the config with a message saying to update. `brady-ctl --version` prints the version.
-- **Tiling:** the first visible top-level window of any process in the app's job is reparented into a grid cell. If that window closes, for example a splash screen, the next one is picked up. Console windows are created hidden and only shown inside their tile, so they never appear in the taskbar.
-- **Keyboard:** click inside a tile to type into it; the focused tile's header turns blue.
-- **One host per config:** launching a config that's already running brings its window to the front instead of starting a second host, first starting any apps the new selection adds (`brady-ctl up --exact` also stops the ones it leaves out). `--new-instance` opts out.
-- **Crashes:** an app that exits with a non-zero code or fails to launch gets a red tile header, and the taskbar button flashes until you look (`flash_on_crash = false` turns the flashing off).
-- **Health:** `health = { interval_ms = 10000, failures = 3 }` keeps running an app's `tcp`/`http` `ready` check after startup, and shows it as `unhealthy` while it keeps failing. `health = { http = "https://localhost:8000" }` gives it a check of its own, for apps whose `ready` is a `log` regex.
-- **Window layout:** the window's position, size and zoomed tile are restored on the next start of the same config (`remember_layout = false` turns this off).
-- **Zoom:** double-click a tile's header to show that tile alone, filling the window. Double-click it again to return to the grid.
-- **Links:** `url = "https://localhost:8002"` shows a link in the tile header that opens in the browser.
-- **.NET:** set `exit_with = "main"` on `dotnet run`/`dotnet watch` apps. Otherwise the build servers they leave running keep the app counted as alive, so exits aren't detected and shutdown waits out every timeout. See the .NET section of [docs/AGENTS.md](docs/AGENTS.md).
-- **Restart:** an app that exits on its own is relaunched when `restart = "on-failure"` (non-zero exit or failed launch) or `"always"` is set. The delay (`restart_delay_ms`, default 1000) doubles up to 30s while the app keeps exiting within 10s. A restart waits for the app's dependencies again.
-- **Checking a config:** `brady-ctl check` validates a config without launching it, including whether each app's exe and working directory can be found, with line numbers. `--no-dialog` makes `brady-bunch.exe` report errors on stderr and in the event log instead of a message box.
-- **Control:** `brady-ctl up` starts the host (or reuses a running one) and returns once everything is ready, with exit code 4 and the status JSON if something fails. `brady-ctl down` shuts it down and returns once it has exited. `status` prints every app's state as JSON; `start`, `stop`, `restart`, `wait` and `tail <app>` act on one app. `events` prints the end of the event log, also after the host has exited. `log = 'path'` copies an app's console output to a file, as UTF-8 (`encoding = "oem"` or `"ansi"` for programs that write in those code pages).
-- **Rebuilds:** `brady-ctl run build` reruns a task after startup. It first stops the apps listed in the task's `stops` (or `--stop`), which would otherwise lock the files it writes, then starts them again once the task succeeds, and reports `build: done (8.4s); restarted api, worker; ready (14.8s)`.
-- **Shutdown** (closing the window, or `taskkill` without `/f`): apps are stopped one at a time, each after the apps that depend on it, otherwise in reverse config order. For each app:
-  - Console apps get Ctrl+C. If they're still running, their console window is closed (`CTRL_CLOSE_EVENT`). A batch wrapper left at `Terminate batch job (Y/N)?`, or a `cmd` shell, is closed right away instead of after the timeout.
-  - GUI apps get `WM_CLOSE`.
-  - Each step waits `shutdown_timeout_ms` before escalating. Anything left after that is terminated.
-  - Closing the host a second time kills everything immediately.
-  - `event_log = 'path'` records which step stopped each app and how long it took, with local times and their UTC offset. The previous run's log is kept as `name.1.log` (`keep_logs` sets how many), and so are the apps' `log` files.
+`brady-ctl` controls a running stack from a shell or script:
+
+| Command | Does |
+|---|---|
+| `brady-ctl check` | Validate the config without starting anything. |
+| `brady-ctl up` | Start the stack and wait until everything is ready. |
+| `brady-ctl down` | Stop it gracefully and wait until it has exited. |
+| `brady-ctl status` | Every app's state, as JSON. |
+| `brady-ctl restart api` | Restart one app. Also `start`, `stop` and `wait`. |
+| `brady-ctl run build` | Rerun a task, stopping the apps that lock its output first. |
+| `brady-ctl tail api` | Print an app's recent console output. |
+
+See [brady-ctl](https://github.com/ryancole/brady-bunch/wiki/brady-ctl) for every option and exit code.
+
+## Learn more
+
+- [Configuration](https://github.com/ryancole/brady-bunch/wiki/Configuration): every setting
+- [Startup Order and Readiness](https://github.com/ryancole/brady-bunch/wiki/Startup-Order-and-Readiness): `depends_on`, `ready`, health checks, apps already running elsewhere
+- [Tasks and Rebuilds](https://github.com/ryancole/brady-bunch/wiki/Tasks-and-Rebuilds): builds before startup, and rebuilding while running
+- [Profiles and Selections](https://github.com/ryancole/brady-bunch/wiki/Profiles-and-Selections): one config, several ways to run it
+- [Recipes](https://github.com/ryancole/brady-bunch/wiki/Recipes): .NET, Node, Java, Python and more
+- [Troubleshooting](https://github.com/ryancole/brady-bunch/wiki/Troubleshooting)
+- [AGENTS.md](docs/AGENTS.md): a complete reference written for AI coding agents that drive brady-bunch
 
 ## Limitations
 
-- Store/UWP apps (the new Notepad, Calculator, Windows Terminal) don't embed.
-- A GUI app's window can show on the desktop and in the taskbar for a moment before it's embedded, since brady-bunch can only pick it up once the app has shown it. Console apps don't.
+- Store/UWP apps (the new Notepad, Calculator, Windows Terminal) run but can't be embedded.
 - Elevated apps can't be embedded by a host that isn't elevated.
-- `taskkill /f` on the host skips graceful shutdown; the job objects still kill the children.
-- With `log` (or `ready.log`), the app's output goes through a pipe, so the app no longer sees a console on stdout/stderr. Some programs then drop colours and progress bars, or buffer their output.
+- A GUI app's window can show on the desktop for a moment before it's embedded. Console apps don't.
+- Force-killing the host (`taskkill /f`) skips graceful shutdown, though every child is still killed.
+- With `log` (or `ready = { log = ... }`), an app's output goes through a pipe, so some programs drop colours and progress bars, or buffer their output.
 
-## Testing
+## Contributing
 
-`cargo test` runs the unit tests and `tests/shim.rs`, which runs `brady-shim.exe` directly (including the command-line quoting regression).
-
-`cargo build --example probe` builds a console app that logs which control event it received. Point an `[[app]]` at `target\debug\examples\probe.exe <logfile>`.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and releasing.
